@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/Arin/ARME-Library-Test/Packages -type f -name *.cs)",
+      "Bash(xargs grep:*)"
+    ]
+  }
+}
