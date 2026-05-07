@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(find /c/Users/Arin/ARME-Library-Test/Packages -type f -name *.cs)",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "Bash(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\" -Recurse -Include \"*.cs\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\\\\Assets\" -Directory)",
+      "Bash(Select-Object -ExpandProperty Name)",
+      "PowerShell(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\\\\Assets\\\\ARME\" -Recurse | Where-Object {$_.PSIsContainer} | Select-Object -ExpandProperty FullName | Sort-Object)"
     ]
   }
 }

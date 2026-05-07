@@ -4,6 +4,16 @@ using System.Collections.Concurrent;
 using UnityEngine;
 using NaughtyAttributes;
 
+/// <summary>Payload fired when the Teensy hardware sensor registers a tap.</summary>
+public readonly struct HardwareTapEvent
+{
+    public readonly float gameTime;
+    public readonly int tapCount;
+    public readonly int force;
+    public HardwareTapEvent(float gameTime, int tapCount, int force)
+    { this.gameTime = gameTime; this.tapCount = tapCount; this.force = force; }
+}
+
 public class ARMETapDetection : MonoBehaviour
 {
     [BoxGroup("Serial Settings")]
@@ -57,6 +67,9 @@ public class ARMETapDetection : MonoBehaviour
     private Thread _readThread;
     private volatile bool _keepReading;
     private readonly ConcurrentQueue<string> _lineQueue = new ConcurrentQueue<string>();
+
+    // ── Data Logging Event ───────────────────────────────────────────────
+    public event System.Action<HardwareTapEvent> OnHardwareTap;
 
     private DropdownList<string> GetAvailablePorts()
     {
@@ -166,6 +179,7 @@ public class ARMETapDetection : MonoBehaviour
         tapDetected = true;
         _tapFlashTimer = Time.time;
 
+        OnHardwareTap?.Invoke(new HardwareTapEvent(Time.time, tapCount, lastForce));
         AppendLog($"[{Time.time:F2}s] Tap #{tapCount}  Force: {lastForce}");
         Debug.Log($"Tap #{tapCount} | Force: {lastForce}");
     }

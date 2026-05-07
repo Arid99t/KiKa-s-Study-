@@ -4,6 +4,68 @@ using UnityEngine.InputSystem;
 using NaughtyAttributes;
 using ARMETiming;
 
+/// <summary>Configuration snapshot passed to the data logger at session start.</summary>
+public struct SessionConfig
+{
+    public int numVirtualPlayers;
+    public EnsembleMode startMode;
+    public float alpha, beta, userIoiSmoothing;
+    public float fixedBPM;
+    public float agenticIoiVariation, agenticTimingNoise, agenticBaselinePull;
+}
+
+/// <summary>Payload fired when the user taps.</summary>
+public readonly struct UserStudyTapEvent
+{
+    public readonly float gameTime;
+    public readonly int tapNumber;
+    public readonly float interval;
+    public readonly float measuredIOI;
+    public readonly float bpm;
+    public readonly EnsembleMode mode;
+    public readonly bool adaptiveMode;
+    public UserStudyTapEvent(float gameTime, int tapNumber, float interval,
+        float measuredIOI, float bpm, EnsembleMode mode, bool adaptiveMode)
+    {
+        this.gameTime = gameTime; this.tapNumber = tapNumber; this.interval = interval;
+        this.measuredIOI = measuredIOI; this.bpm = bpm;
+        this.mode = mode; this.adaptiveMode = adaptiveMode;
+    }
+}
+
+/// <summary>Payload fired each time a virtual player blinks.</summary>
+public readonly struct UserStudyBlinkEvent
+{
+    public readonly float gameTime;
+    public readonly int playerIndex;
+    public readonly int onsetCount;
+    public readonly float currentIOI;
+    public readonly float nextBlinkTime;
+    public readonly string blinkType;
+    public UserStudyBlinkEvent(float gameTime, int playerIndex, int onsetCount,
+        float currentIOI, float nextBlinkTime, string blinkType)
+    {
+        this.gameTime = gameTime; this.playerIndex = playerIndex;
+        this.onsetCount = onsetCount; this.currentIOI = currentIOI;
+        this.nextBlinkTime = nextBlinkTime; this.blinkType = blinkType;
+    }
+}
+
+/// <summary>Payload fired when the ensemble mode or adaptive sub-state changes.</summary>
+public readonly struct UserStudyModeEvent
+{
+    public readonly float gameTime;
+    public readonly EnsembleMode ensembleMode;
+    public readonly bool adaptiveMode;
+    public readonly string description;
+    public UserStudyModeEvent(float gameTime, EnsembleMode ensembleMode,
+        bool adaptiveMode, string description)
+    {
+        this.gameTime = gameTime; this.ensembleMode = ensembleMode;
+        this.adaptiveMode = adaptiveMode; this.description = description;
+    }
+}
+
 /// <summary>
 /// Experimental condition for the ensemble.
 ///   Adaptive    — Wing-Kristofferson coupling: virtuals follow the user.
@@ -144,6 +206,25 @@ public class ARMEUserStudyController : MonoBehaviour
     private bool _haveSpawnGaussian;
     private float _spareGaussian;
 
+    // ── Data Logging Events ──────────────────────────────────────────────
+    public event System.Action<UserStudyTapEvent>   OnUserTap;
+    public event System.Action<UserStudyBlinkEvent> OnVirtualBlink;
+    public event System.Action<UserStudyModeEvent>  OnModeChange;
+
+    /// <summary>Returns a configuration snapshot for CSV session metadata.</summary>
+    public SessionConfig GetSessionConfig() => new SessionConfig
+    {
+        numVirtualPlayers   = numVirtualPlayers,
+        startMode           = mode,
+        alpha               = alpha,
+        beta                = beta,
+        userIoiSmoothing    = userIoiSmoothing,
+        fixedBPM            = fixedBPM,
+        agenticIoiVariation = agenticIoiVariation,
+        agenticTimingNoise  = agenticTimingNoise,
+        agenticBaselinePull = agenticBaselinePull,
+    };
+
     private int TotalPlayers => numVirtualPlayers + 1;
 
     void Start()
@@ -269,6 +350,8 @@ public class ARMEUserStudyController : MonoBehaviour
         _previousUserTapTime = t;
         lastUserTapTime = t;
 
+        OnUserTap?.Invoke(new UserStudyTapEvent(t, userTapCount, interval, measuredUserIOI, currentUserBPM, mode, adaptiveMode));
+
         Log($"USER TAP #{userTapCount} @ t={t:F3}s  Δ={interval:F3}s  measuredIOI={measuredUserIOI:F3}s  BPM={currentUserBPM:F1}  totalUserOnsets={_onsetCounts[UserPlayerIndex]} mode={mode}");
 
         // Non-Adaptive mode ignores user taps for timing — they're recorded only for logging/model state.
@@ -281,6 +364,8 @@ public class ARMEUserStudyController : MonoBehaviour
         if (mode == EnsembleMode.Adaptive && !adaptiveMode)
         {
             adaptiveMode = true;
+            OnModeChange?.Invoke(new UserStudyModeEvent(t, mode, true,
+                $"Adaptive activated: IOI={measuredUserIOI:F3}s BPM={currentUserBPM:F1}"));
             Log($">>> Switching to ADAPTIVE mode. Initial userIOI={measuredUserIOI:F3}s, BPM={currentUserBPM:F1}");
             for (int i = 1; i < TotalPlayers; i++)
             {
@@ -290,7 +375,12 @@ public class ARMEUserStudyController : MonoBehaviour
         }
 
         // Agentic mode is always "weakly adapting" once the user is tapping.
-        if (mode == EnsembleMode.Agentic) adaptiveMode = true;
+        if (mode == EnsembleMode.Agentic)
+        {
+            if (!adaptiveMode)
+                OnModeChange?.Invoke(new UserStudyModeEvent(t, mode, true, "Agentic active: user tapping"));
+            adaptiveMode = true;
+        }
 
         ApplyCorrections(t);
     }
@@ -364,6 +454,8 @@ public class ARMEUserStudyController : MonoBehaviour
         if (idleSec > threshold)
         {
             adaptiveMode = false;
+            OnModeChange?.Invoke(new UserStudyModeEvent(now, mode, false,
+                $"Reverted to Random: idle {idleSec:F2}s > threshold {threshold:F2}s"));
             Log($"<<< User idle for {idleSec:F2}s (> {threshold:F2}s) — reverting to RANDOM mode");
             // Re-randomise virtual IOIs so future blinks scatter again.
             for (int i = 1; i < TotalPlayers; i++)
@@ -413,6 +505,7 @@ public class ARMEUserStudyController : MonoBehaviour
 
             _nextBlinkTime[i] = onsetTime + _virtualIOI[i];
             Log($"P{i} BLINK (adaptive) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  next={_nextBlinkTime[i]:F3}s  totalOnsets={_onsetCounts[i]}");
+            OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], _virtualIOI[i], _nextBlinkTime[i], "adaptive"));
         }
         else
         {
@@ -420,6 +513,7 @@ public class ARMEUserStudyController : MonoBehaviour
             float nextInterval = Random.Range(minRandomInterval, maxRandomInterval);
             _nextBlinkTime[i] = now + nextInterval;
             Log($"P{i} BLINK (random) @ t={onsetTime:F3}s  nextInterval={nextInterval:F3}s  next={_nextBlinkTime[i]:F3}s");
+            OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], nextInterval, _nextBlinkTime[i], "random"));
         }
     }
 
@@ -429,6 +523,7 @@ public class ARMEUserStudyController : MonoBehaviour
         float ioi = _virtualBaselineIOI[i];
         _nextBlinkTime[i] = onsetTime + ioi;
         Log($"P{i} BLINK (non-adaptive) @ t={onsetTime:F3}s  IOI={ioi:F3}s  next={_nextBlinkTime[i]:F3}s");
+        OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], ioi, _nextBlinkTime[i], "non-adaptive"));
     }
 
     private void ScheduleAgenticBlink(int i, float onsetTime)
@@ -451,6 +546,7 @@ public class ARMEUserStudyController : MonoBehaviour
 
         _nextBlinkTime[i] = onsetTime + interval;
         Log($"P{i} BLINK (agentic) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  jitter={jitter:+0.000;-0.000}s  interval={interval:F3}s  next={_nextBlinkTime[i]:F3}s");
+        OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], interval, _nextBlinkTime[i], "agentic"));
     }
 
     /// <summary>Box-Muller standard-normal sample (mean 0, stddev 1).</summary>
