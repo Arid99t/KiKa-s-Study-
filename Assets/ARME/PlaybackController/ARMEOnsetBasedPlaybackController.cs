@@ -124,6 +124,18 @@ namespace ARMEPlayback
         }
 
         /// <summary>
+        /// Assign the audio clip and onset file at runtime or from editor tooling,
+        /// before Start() runs. Parses the onset file immediately so onset data is
+        /// available to the ensemble controller. Used by the ensemble auto-wire helper.
+        /// </summary>
+        public void Configure(AudioClip clip, TextAsset onsets)
+        {
+            audioClip = clip;
+            onsetFile = onsets;
+            ParseOnsetFile();
+        }
+
+        /// <summary>
         /// Request padding to be applied during initialization
         /// Called by ensemble controller before Unity starts playing
         /// </summary>
@@ -256,6 +268,16 @@ namespace ARMEPlayback
                 
                 if (enableDebugLogging)
                     Debug.Log($"🎵 [{gameObject.name}] Playback Controller ready! Onsets: {originalOnsetTimes.Count}");
+            }
+            catch (DllNotFoundException ex)
+            {
+                // The native time-stretch library (or one of its dependencies such as
+                // rubberband-3.dll / samplerate.dll / sleef.dll) could not be loaded. Fail
+                // softly: this part stays silent instead of throwing, so the rest of the
+                // scene keeps working.
+                Debug.LogWarning($"[{gameObject.name}] Native audio library 'ARMEPlaybackControllerLib' could not be loaded ({ex.Message}). " +
+                    "Its native dependencies (rubberband-3.dll, samplerate.dll, sleef.dll, sleefdft.dll) are probably missing from Assets/Plugins/. " +
+                    "This part will be SILENT. For DLL-free synchronized playback, use the ARMEEnsembleSyncPlayer component instead.");
             }
             catch (ARMEPlaybackException ex)
             {

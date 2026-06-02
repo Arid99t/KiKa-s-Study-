@@ -9,16 +9,32 @@ public class VideoPlayerController : MonoBehaviour
     public Material targetAlphaMaterial;
     public GameObject videoDisplayPlaneObject;
 
-    // Start is called once before the first execution of Update after the MonoBehaviour is created
+    [Header("Tap Tempo Control")]
+    [Tooltip("Assign the ARMETapDetection component to drive playback speed from tap tempo")]
+    public ARMETapDetection tapDetection;
+
     void Start()
     {
-        
+        if (videoPlayer != null)
+        {
+            videoPlayer.audioOutputMode = VideoAudioOutputMode.Direct;
+            videoPlayer.prepareCompleted += vp =>
+            {
+                Debug.Log($"VideoPlayer canSetPlaybackSpeed: {vp.canSetPlaybackSpeed}");
+                Debug.Log($"VideoPlayer canSetTime: {vp.canSetTime}");
+            };
+        }
     }
 
-    // Update is called once per frame
     void Update()
     {
-        
+        if (tapDetection != null && videoPlayer != null && videoPlayer.isPlaying)
+        {
+            if (videoPlayer.canSetPlaybackSpeed)
+            {
+                videoPlayer.playbackSpeed = tapDetection.PlaybackSpeedRatio;
+            }
+        }
     }
 
     void OnValidate()

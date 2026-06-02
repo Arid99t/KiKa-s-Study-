@@ -11,7 +11,7 @@ GameObject:
   - component: {fileID: 1352862802798525069}
   - component: {fileID: 5066693245048527804}
   m_Layer: 0
-  m_Name: TopBottomVideoRender
+  m_Name: TopBottomVideoRender 2
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -40,11 +40,11 @@ VideoPlayer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1954387802402173509}
   m_Enabled: 1
-  m_VideoClip: {fileID: 32900000, guid: 2c63dd04e4fe0e24080c98354da97009, type: 3}
+  m_VideoClip: {fileID: 32900000, guid: af7287a2e070ff7409c3ba5d30fef273, type: 3}
   m_TargetCameraAlpha: 1
   m_TargetCamera3DLayout: 0
   m_TargetCamera: {fileID: 0}
-  m_TargetTexture: {fileID: 8400000, guid: 5c82497afd784e947b6c8a866f6ba4a6, type: 2}
+  m_TargetTexture: {fileID: 8400000, guid: 570da46befb1a2941925c9f977739321, type: 2}
   m_TimeReference: 0
   m_TargetMaterialRenderer: {fileID: 0}
   m_TargetMaterialProperty: <noninit>

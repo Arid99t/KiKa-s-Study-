@@ -83,6 +83,21 @@ public enum EnsembleMode
 }
 
 /// <summary>
+/// How tightly virtuals lock onto the user's beat in Adaptive mode.
+///   Custom        — Use inspector alpha/beta values verbatim (loose Wing-Kristofferson default).
+///   MusicalLoose  — Same as Custom but guarantees the phase-reset on activation (fixes drift-in bug).
+///   MusicalTight  — Stronger coupling (α≈0.6, β≈0.35); locks on within a few taps, still feels organic.
+///   SnapToBeat    — α=1, β=1; spheres snap exactly to the predicted next beat each tap. Looks perfectly synced.
+/// </summary>
+public enum SyncTightness
+{
+    Custom,
+    MusicalLoose,
+    MusicalTight,
+    SnapToBeat
+}
+
+/// <summary>
 /// User study controller for the ARME Timing Model. See <see cref="EnsembleMode"/>
 /// for the three experimental conditions.
 /// </summary>
@@ -124,11 +139,15 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private float maxRandomInterval = 1.2f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Phase-correction gain. Each user tap pulls each virtual's next-blink time toward the model's predicted onset by this fraction of the error. 0 = no phase coupling, 1 = snap to prediction immediately.")]
+    [Tooltip("Preset that overrides alpha/beta to control how tightly virtuals lock onto your beat. Set to Custom to use the alpha/beta sliders below.")]
+    [SerializeField] private SyncTightness syncTightness = SyncTightness.MusicalTight;
+
+    [BoxGroup("Adaptation (Wing-Kristofferson)")]
+    [Tooltip("Phase-correction gain. Each user tap pulls each virtual's next-blink time toward the model's predicted onset by this fraction of the error. 0 = no phase coupling, 1 = snap to prediction immediately. Ignored unless syncTightness = Custom.")]
     [SerializeField, Range(0f, 1f)] private float alpha = 0.30f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Period-correction gain. Each user tap blends each virtual's internal IOI toward the user's measured IOI by this fraction. 0 = no tempo adaptation, 1 = match user immediately.")]
+    [Tooltip("Period-correction gain. Each user tap blends each virtual's internal IOI toward the user's measured IOI by this fraction. 0 = no tempo adaptation, 1 = match user immediately. Ignored unless syncTightness = Custom.")]
     [SerializeField, Range(0f, 1f)] private float beta = 0.15f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
@@ -206,6 +225,14 @@ public class ARMEUserStudyController : MonoBehaviour
     private bool _haveSpawnGaussian;
     private float _spareGaussian;
 
+    // ARME expects ensemble onsets to share a beat index across players. We increment a
+    // shared beat counter on each user tap and register the user + each virtual whose
+    // most recent blink is "pending" under that same index. Without this the per-player
+    // onset counts diverge as virtuals freewheel and ARME's predictions degenerate to
+    // -900 sentinels or past-time values.
+    private int _currentBeatIndex;
+    private float[] _pendingBlinkTime;    // virtual's most recent blink time awaiting a beat slot (-1 = none)
+
     // ── Data Logging Events ──────────────────────────────────────────────
     public event System.Action<UserStudyTapEvent>   OnUserTap;
     public event System.Action<UserStudyBlinkEvent> OnVirtualBlink;
@@ -237,6 +264,9 @@ public class ARMEUserStudyController : MonoBehaviour
         _nextBlinkTime = new float[TotalPlayers];
         _flashStartTime = new float[TotalPlayers];
         _onsetCounts = new int[TotalPlayers];
+        _pendingBlinkTime = new float[TotalPlayers];
+        for (int i = 0; i < TotalPlayers; i++) _pendingBlinkTime[i] = -1f;
+        _currentBeatIndex = 0;
 
         SpawnVirtualPlayers();
         InitVirtualsForMode();
@@ -328,13 +358,31 @@ public class ARMEUserStudyController : MonoBehaviour
         float t = Time.time;
         userTapCount++;
 
-        // Register user onset to the model.
+        // Register user onset to the model using an explicit, monotonically increasing
+        // beat index. All players' onsets for the same beat share this index so ARME
+        // can correlate them as ensemble partners.
+        _currentBeatIndex++;
         try
         {
-            _model.RegisterOnset(UserPlayerIndex, t);
+            _model.RegisterOnsetWithIndex(UserPlayerIndex, t, _currentBeatIndex);
             _onsetCounts[UserPlayerIndex]++;
         }
         catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] User onset register failed: {ex.Message}"); }
+
+        // Flush any pending virtual blinks into this beat slot. Virtuals fire on their
+        // own clock between user taps; we record the blink time and only commit it to
+        // ARME here, paired with the user's beat index.
+        for (int i = 1; i < TotalPlayers; i++)
+        {
+            if (_pendingBlinkTime[i] < 0f) continue;
+            try
+            {
+                _model.RegisterOnsetWithIndex(i, _pendingBlinkTime[i], _currentBeatIndex);
+                _onsetCounts[i]++;
+            }
+            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} flush register failed: {ex.Message}"); }
+            _pendingBlinkTime[i] = -1f;
+        }
 
         // Measure inter-tap interval and smooth it into the user's IOI estimate.
         float interval = (_previousUserTapTime > 0f) ? (t - _previousUserTapTime) : 0f;
@@ -370,7 +418,10 @@ public class ARMEUserStudyController : MonoBehaviour
             for (int i = 1; i < TotalPlayers; i++)
             {
                 _virtualIOI[i] = measuredUserIOI;
-                Log($"  -> P{i} virtualIOI initialised to {measuredUserIOI:F3}s");
+                // Reset phase so virtuals start aligned to the user's beat instead of
+                // their random pre-activation schedule.
+                _nextBlinkTime[i] = t + measuredUserIOI + phaseOffsetPerPlayer * i;
+                Log($"  -> P{i} virtualIOI={measuredUserIOI:F3}s, nextBlink reset to {_nextBlinkTime[i]:F3}s");
             }
         }
 
@@ -385,11 +436,32 @@ public class ARMEUserStudyController : MonoBehaviour
         ApplyCorrections(t);
     }
 
+    /// <summary>
+    /// Resolve the active coupling gains for the current mode and sync-tightness preset.
+    /// Agentic always uses its own weak gains; Adaptive uses the preset (or Custom = inspector values).
+    /// </summary>
+    private void GetEffectiveGains(out float effAlpha, out float effBeta)
+    {
+        if (mode == EnsembleMode.Agentic)
+        {
+            effAlpha = agenticAlpha;
+            effBeta  = agenticBeta;
+            return;
+        }
+
+        switch (syncTightness)
+        {
+            case SyncTightness.MusicalLoose: effAlpha = 0.30f; effBeta = 0.15f; break;
+            case SyncTightness.MusicalTight: effAlpha = 0.60f; effBeta = 0.35f; break;
+            case SyncTightness.SnapToBeat:   effAlpha = 1.00f; effBeta = 1.00f; break;
+            case SyncTightness.Custom:
+            default:                         effAlpha = alpha; effBeta = beta;  break;
+        }
+    }
+
     private void ApplyCorrections(float now)
     {
-        // Pick coupling strength for the active mode.
-        float effectiveAlpha = (mode == EnsembleMode.Agentic) ? agenticAlpha : alpha;
-        float effectiveBeta  = (mode == EnsembleMode.Agentic) ? agenticBeta  : beta;
+        GetEffectiveGains(out float effectiveAlpha, out float effectiveBeta);
 
         // Get ARME's predictions; these become the phase-correction targets.
         float[] predictions = null;
@@ -457,9 +529,13 @@ public class ARMEUserStudyController : MonoBehaviour
             OnModeChange?.Invoke(new UserStudyModeEvent(now, mode, false,
                 $"Reverted to Random: idle {idleSec:F2}s > threshold {threshold:F2}s"));
             Log($"<<< User idle for {idleSec:F2}s (> {threshold:F2}s) — reverting to RANDOM mode");
-            // Re-randomise virtual IOIs so future blinks scatter again.
+            // Re-randomise virtual IOIs so future blinks scatter again, and drop any
+            // pending blink registrations (they would belong to a stale beat).
             for (int i = 1; i < TotalPlayers; i++)
+            {
                 _virtualIOI[i] = Random.Range(minRandomInterval, maxRandomInterval);
+                _pendingBlinkTime[i] = -1f;
+            }
         }
     }
 
@@ -495,16 +571,14 @@ public class ARMEUserStudyController : MonoBehaviour
     {
         if (adaptiveMode)
         {
-            // Register virtual blink to the model so it can refine its predictions.
-            try
-            {
-                _model.RegisterOnset(i, onsetTime);
-                _onsetCounts[i]++;
-            }
-            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} register failed: {ex.Message}"); }
+            // Defer ARME registration until the next user tap, where the shared beat
+            // slot is known. Overwriting any earlier pending blink is intentional:
+            // if the virtual fires faster than the user, only the most recent blink
+            // counts for the upcoming beat.
+            _pendingBlinkTime[i] = onsetTime;
 
             _nextBlinkTime[i] = onsetTime + _virtualIOI[i];
-            Log($"P{i} BLINK (adaptive) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  next={_nextBlinkTime[i]:F3}s  totalOnsets={_onsetCounts[i]}");
+            Log($"P{i} BLINK (adaptive) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  next={_nextBlinkTime[i]:F3}s  pendingForBeat={_currentBeatIndex + 1}");
             OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], _virtualIOI[i], _nextBlinkTime[i], "adaptive"));
         }
         else
@@ -600,8 +674,13 @@ public class ARMEUserStudyController : MonoBehaviour
         measuredUserIOI = 0f;
         lastUserTapTime = 0f;
         _previousUserTapTime = -1f;
+        _currentBeatIndex = 0;
 
-        for (int i = 0; i < TotalPlayers; i++) _onsetCounts[i] = 0;
+        for (int i = 0; i < TotalPlayers; i++)
+        {
+            _onsetCounts[i] = 0;
+            _pendingBlinkTime[i] = -1f;
+        }
         InitVirtualsForMode();
         Log($"RESET complete. Mode={mode}.");
     }

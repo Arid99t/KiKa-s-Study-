@@ -240,7 +240,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e65f14d4ca2cdc042949d99cb8ba1594, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ARMETapDetection
-  portName: 
+  portName: COM4
   baudRate: 115200
   autoConnectOnStart: 1
   isConnected: 1
@@ -249,6 +249,13 @@ MonoBehaviour:
   lastForce: 0
   forceBar: 0
   timeSinceLastTap: 0
+  referenceBPM: 120
+  tempoWindowSize: 4
+  speedSmoothRate: 5
+  minSpeed: 0.25
+  maxSpeed: 3
+  currentBPM: 0
+  playbackSpeedRatio: 1
   tapLog: 
 --- !u!4 &642698383
 Transform:

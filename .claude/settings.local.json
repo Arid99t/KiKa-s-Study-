@@ -8,7 +8,15 @@
       "Bash(Sort-Object)",
       "Bash(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\\\\Assets\" -Directory)",
       "Bash(Select-Object -ExpandProperty Name)",
-      "PowerShell(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\\\\Assets\\\\ARME\" -Recurse | Where-Object {$_.PSIsContainer} | Select-Object -ExpandProperty FullName | Sort-Object)"
+      "PowerShell(Get-ChildItem -Path \"e:\\\\Unity Projects\\\\ARME-Library-Test\\\\Assets\\\\ARME\" -Recurse | Where-Object {$_.PSIsContainer} | Select-Object -ExpandProperty FullName | Sort-Object)",
+      "Bash(git -C \"c:/Users/Arin/ARME-Library-Test\" status --short)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(git status *)",
+      "Bash(git grep *)",
+      "Bash(grep -v -i '/Library/\\\\|/obj/\\\\|/Temp/')",
+      "Bash(ls -la *.dll)",
+      "Bash(ls *.meta)",
+      "Bash(grep -n -E \"value: \\(TopBottomVideoRender|VideoPlayerPlane\\)|propertyPath: \\(m_TargetTexture|m_VideoClip\\)|m_Materials.Array.data\\\\[0\\\\]|objectReference: \\\\{fileID: [0-9]+, guid:\" \"Assets/Scenes/User Study.unity\")"
     ]
   }
 }

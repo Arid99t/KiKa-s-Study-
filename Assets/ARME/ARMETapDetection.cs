@@ -54,10 +54,48 @@ public class ARMETapDetection : MonoBehaviour
     [ReadOnly, AllowNesting]
     [SerializeField] private float timeSinceLastTap;
 
+    [HorizontalLine(color: EColor.White)]
+
+    [BoxGroup("Tempo")]
+    [Tooltip("Reference BPM that maps to 1.0x playback speed")]
+    [SerializeField] private float referenceBPM = 120f;
+
+    [BoxGroup("Tempo")]
+    [Tooltip("How many recent taps to average for tempo calculation")]
+    [Range(2, 16)]
+    [SerializeField] private int tempoWindowSize = 4;
+
+    [BoxGroup("Tempo")]
+    [Tooltip("How quickly playback speed adjusts (lower = smoother)")]
+    [Range(0.5f, 20f)]
+    [SerializeField] private float speedSmoothRate = 5f;
+
+    [BoxGroup("Tempo")]
+    [Tooltip("Minimum playback speed")]
+    [SerializeField] private float minSpeed = 0.25f;
+
+    [BoxGroup("Tempo")]
+    [Tooltip("Maximum playback speed")]
+    [SerializeField] private float maxSpeed = 3f;
+
+    [BoxGroup("Tempo")]
+    [ReadOnly, AllowNesting]
+    [SerializeField] private float currentBPM;
+
+    [BoxGroup("Tempo")]
+    [ReadOnly, AllowNesting]
+    [SerializeField] private float playbackSpeedRatio = 1f;
+
     [BoxGroup("Tap Log")]
     [ReadOnly, AllowNesting]
     [ResizableTextArea]
     [SerializeField] private string tapLog = "";
+
+    /// <summary>Current playback speed ratio (1.0 = reference tempo). Use this to drive VideoPlayer.playbackSpeed.</summary>
+    public float PlaybackSpeedRatio => playbackSpeedRatio;
+
+    /// <summary>Current estimated BPM from tap tempo.</summary>
+    public float CurrentBPM => currentBPM;
 
     private SerialPort _serialPort;
     private float _lastTapTimestamp;
@@ -70,6 +108,9 @@ public class ARMETapDetection : MonoBehaviour
 
     // ── Data Logging Event ───────────────────────────────────────────────
     public event System.Action<HardwareTapEvent> OnHardwareTap;
+
+    private readonly System.Collections.Generic.List<float> _tapTimestamps = new System.Collections.Generic.List<float>();
+    private float _targetSpeed = 1f;
 
     private DropdownList<string> GetAvailablePorts()
     {
@@ -111,6 +152,9 @@ public class ARMETapDetection : MonoBehaviour
         {
             ParseTapLine(line);
         }
+
+        // Smoothly interpolate playback speed toward target
+        playbackSpeedRatio = Mathf.Lerp(playbackSpeedRatio, _targetSpeed, Time.deltaTime * speedSmoothRate);
     }
 
     private void ReadSerialThread()
@@ -180,8 +224,21 @@ public class ARMETapDetection : MonoBehaviour
         _tapFlashTimer = Time.time;
 
         OnHardwareTap?.Invoke(new HardwareTapEvent(Time.time, tapCount, lastForce));
-        AppendLog($"[{Time.time:F2}s] Tap #{tapCount}  Force: {lastForce}");
-        Debug.Log($"Tap #{tapCount} | Force: {lastForce}");
+
+        // Tempo calculation
+        _tapTimestamps.Add(Time.time);
+        if (_tapTimestamps.Count > tempoWindowSize)
+            _tapTimestamps.RemoveAt(0);
+
+        if (_tapTimestamps.Count >= 2)
+        {
+            float totalInterval = _tapTimestamps[_tapTimestamps.Count - 1] - _tapTimestamps[0];
+            float avgInterval = totalInterval / (_tapTimestamps.Count - 1);
+            currentBPM = 60f / avgInterval;
+            _targetSpeed = Mathf.Clamp(currentBPM / referenceBPM, minSpeed, maxSpeed);
+        }
+
+        AppendLog($"[{Time.time:F2}s] Tap #{tapCount}  Force: {lastForce}  BPM: {currentBPM:F0}");
     }
 
     private void AppendLog(string entry)
