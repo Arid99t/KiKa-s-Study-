@@ -1,8 +1,11 @@
+using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.Video;
 using NaughtyAttributes;
 using ARMETiming;
+using ARMEPlayback;
 
 /// <summary>Configuration snapshot passed to the data logger at session start.</summary>
 public struct SessionConfig
@@ -98,6 +101,38 @@ public enum SyncTightness
 }
 
 /// <summary>
+/// One musician video driven by the timing model: a <see cref="VideoPlayer"/> (picture),
+/// its audio routed through an <see cref="ARMEOnsetBasedPlaybackController"/> (time-stretch),
+/// and the recorded onset times used to warp it onto the model's beat.
+/// </summary>
+[System.Serializable]
+public class VideoPart
+{
+    [Tooltip("Inspector label only.")]
+    public string label;
+
+    [Tooltip("VideoPlayer that shows this part's clip. Its playbackSpeed is warped to the model's onsets.")]
+    public VideoPlayer video;
+
+    [Tooltip("This part's audio (.wav). Routed through the time-stretch playback controller (silent until the native DLL deps are installed).")]
+    public AudioClip audioClip;
+
+    [Tooltip("Onset file (-CRNNManual): one timestamp per line, used to warp the recording onto the user's beat.")]
+    public TextAsset onsetFile;
+
+    [Tooltip("Optional plane/renderer. If set (and Manage Display is on) the part gets its OWN RenderTexture + material instance so parts can never share a texture.")]
+    public Renderer displayRenderer;
+
+    // ── Runtime state (not serialized) ───────────────────────────────────
+    [System.NonSerialized] public ARMEOnsetBasedPlaybackController audio;
+    [System.NonSerialized] public List<float> onsets;
+    [System.NonSerialized] public float speed;            // current video playbackSpeed
+    [System.NonSerialized] public float desiredTime;      // cumulative desired time for the (silent) audio path
+    [System.NonSerialized] public RenderTexture ownedRT;
+    [System.NonSerialized] public Material matInstance;
+}
+
+/// <summary>
 /// User study controller for the ARME Timing Model. See <see cref="EnsembleMode"/>
 /// for the three experimental conditions.
 /// </summary>
@@ -108,27 +143,27 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private EnsembleMode mode = EnsembleMode.Adaptive;
 
     [BoxGroup("Virtual Players")]
-    [Tooltip("How many virtual player objects to spawn.")]
+    [Tooltip("How many virtual players the timing model runs. Each is mapped (cycling) to one of the scene's video parts. For independent per-musician warp, set this equal to the number of video parts (≤4).")]
     [SerializeField, Range(1, 15)] private int numVirtualPlayers = 3;
 
-    [BoxGroup("Virtual Players")]
-    [SerializeField] private float spacing = 2.5f;
+    [BoxGroup("Videos")]
+    [Tooltip("The musician video parts driven by the model. Leave empty to import them from a scene ARMEEnsembleSyncPlayer (or discover scene VideoPlayers) at runtime, or use the context-menu auto-wire to populate by name.")]
+    [SerializeField] private List<VideoPart> videoParts = new List<VideoPart>();
 
-    [BoxGroup("Virtual Players")]
-    [SerializeField] private float scale = 1.0f;
+    [BoxGroup("Videos")]
+    [Tooltip("Give each part its own RenderTexture + material instance at runtime (binds the '_TB' texture). Only acts on parts whose Display Renderer is set; otherwise the VideoPlayer's existing render target is left untouched.")]
+    [SerializeField] private bool manageDisplay = true;
 
-    [BoxGroup("Virtual Players")]
-    [Tooltip("Where the row of virtual players is centred (world space).")]
-    [SerializeField] private Vector3 spawnCentre = new Vector3(0f, 1f, 0f);
+    [BoxGroup("Videos")]
+    [Tooltip("Shader texture property that receives the video (the AlphaShaderTB / MixVidTB material uses '_TB').")]
+    [SerializeField] private string videoTextureProperty = "_TB";
 
-    [BoxGroup("Blink Visuals")]
-    [SerializeField] private Color baseColor = new Color(0.12f, 0.12f, 0.14f);
+    [BoxGroup("Videos")]
+    [Tooltip("Clamp on the video playback speed while following the user. The video is sped up/slowed so its next onset lands one user-IOI ahead; this bounds how extreme that gets.")]
+    [SerializeField, Range(0.1f, 1f)] private float minPlaybackSpeed = 0.25f;
 
-    [BoxGroup("Blink Visuals")]
-    [SerializeField] private Color blinkColor = new Color(1f, 0.85f, 0.2f);
-
-    [BoxGroup("Blink Visuals")]
-    [SerializeField, Range(0.02f, 0.5f)] private float blinkDuration = 0.12f;
+    [BoxGroup("Videos")]
+    [SerializeField, Range(1f, 4f)] private float maxPlaybackSpeed = 3f;
 
     [BoxGroup("Random Mode")]
     [Tooltip("Minimum random blink interval (seconds) when in Random mode (no recent user input).")]
@@ -214,13 +249,16 @@ public class ARMEUserStudyController : MonoBehaviour
     private const int UserPlayerIndex = 0;
 
     private SimpleTimingModel _model;
-    private GameObject[] _virtualPlayers;
-    private Material[] _materials;
     private float[] _virtualIOI;          // each virtual's current internal IOI
     private float[] _virtualBaselineIOI;  // Agentic: per-virtual baseline tempo
     private float[] _nextBlinkTime;       // when each virtual fires next
-    private float[] _flashStartTime;      // most recent blink start time (for visual)
     private int[] _onsetCounts;
+
+    // Video startup is deferred until every VideoPlayer has finished preparing so the
+    // pictures begin together with the audio.
+    private bool _videosPending;
+    private float _videoArmTime;
+    private bool _videosWarping;   // were the videos following the user last frame?
     private float _previousUserTapTime = -1f;
     private bool _haveSpawnGaussian;
     private float _spareGaussian;
@@ -262,17 +300,20 @@ public class ARMEUserStudyController : MonoBehaviour
         _virtualIOI = new float[TotalPlayers];
         _virtualBaselineIOI = new float[TotalPlayers];
         _nextBlinkTime = new float[TotalPlayers];
-        _flashStartTime = new float[TotalPlayers];
         _onsetCounts = new int[TotalPlayers];
         _pendingBlinkTime = new float[TotalPlayers];
         for (int i = 0; i < TotalPlayers; i++) _pendingBlinkTime[i] = -1f;
         _currentBeatIndex = 0;
 
-        SpawnVirtualPlayers();
+        BindVideoParts();
         InitVirtualsForMode();
 
+        // Defer the actual video/audio start until every clip has finished preparing.
+        _videosPending = true;
+        _videoArmTime = Time.time;
+
         Log($"Ready. Players: {TotalPlayers} (P0=user, P1..P{numVirtualPlayers}=virtual). " +
-            $"Mode={mode}. alpha={alpha:F2}, beta={beta:F2}. Lib v{SimpleTimingModel.GetVersion()}");
+            $"Videos: {videoParts.Count}. Mode={mode}. alpha={alpha:F2}, beta={beta:F2}. Lib v{SimpleTimingModel.GetVersion()}");
     }
 
     /// <summary>
@@ -309,46 +350,249 @@ public class ARMEUserStudyController : MonoBehaviour
                     _nextBlinkTime[i] = Time.time + Random.Range(0.1f, _virtualIOI[i]);
                     break;
             }
-            _flashStartTime[i] = -1f;
         }
     }
 
-    private void SpawnVirtualPlayers()
+    private const string AudioFolder = "Assets/ARME/Ensemble/AudioClipsMain";
+
+    /// <summary>
+    /// Bind the virtual players to the scene's musician videos (replaces sphere spawning).
+    /// Each part gets an <see cref="ARMEOnsetBasedPlaybackController"/> for time-stretched
+    /// audio (which also parses the onset file), and its display is bound so each plane
+    /// shows its own clip.
+    /// </summary>
+    private void BindVideoParts()
     {
-        _virtualPlayers = new GameObject[numVirtualPlayers];
-        _materials = new Material[numVirtualPlayers];
+        if (videoParts == null || videoParts.Count == 0)
+            ImportPartsFromScene();
 
-        float startX = -((numVirtualPlayers - 1) * spacing) * 0.5f;
-        Shader shader = Shader.Find("Standard") ?? Shader.Find("Universal Render Pipeline/Lit");
+        // This controller is the sole driver of the videos. Stop anything else that would
+        // also play/seek them (the EnsembleSync fallback, the stray VideoControllerPrefab) —
+        // two drivers fighting causes the decoder to stall and the picture to slow and freeze.
+        DisableCompetingDrivers();
 
-        for (int i = 0; i < numVirtualPlayers; i++)
+        foreach (var part in videoParts)
         {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            go.name = $"VirtualPlayer_{i + 1}";
-            go.transform.SetParent(transform, false);
-            go.transform.position = spawnCentre + new Vector3(startX + i * spacing, 0f, 0f);
-            go.transform.localScale = Vector3.one * scale;
+            if (part == null || part.video == null)
+                continue;
 
-            var rend = go.GetComponent<Renderer>();
-            var mat = new Material(shader);
-            mat.color = baseColor;
-            rend.material = mat;
+            // Audio path: an AudioSource drives the playback controller's OnAudioFilterRead.
+            // The controller also parses the onset file, which we read back for the warp.
+            if (part.audioClip != null)
+            {
+                var go = new GameObject($"Audio_{part.label}");
+                go.transform.SetParent(transform, false);
 
-            _virtualPlayers[i] = go;
-            _materials[i] = mat;
+                var src = go.AddComponent<AudioSource>();
+                src.playOnAwake = true;
+                src.spatialBlend = 0f;
+                src.clip = null;
+
+                part.audio = go.AddComponent<ARMEOnsetBasedPlaybackController>();
+                part.audio.Configure(part.audioClip, part.onsetFile);
+                part.onsets = part.audio.GetOriginalOnsetTimes();
+            }
+            else
+            {
+                part.onsets = ParseOnsets(part.onsetFile);
+            }
+
+            // Configure the VideoPlayer. It loops and plays at native speed on its own; we
+            // only modulate playbackSpeed to lock it to the user's beat (never seek -> never
+            // snaps). Sound comes from the WAV, not the clip.
+            part.video.audioOutputMode = VideoAudioOutputMode.None;
+            part.video.playOnAwake = false;
+            part.video.isLooping = true;
+            part.video.skipOnDrop = true;
+            part.video.playbackSpeed = 1f;
+
+            if (manageDisplay && part.displayRenderer != null)
+                BindDisplay(part);
+
+            if (!part.video.isPrepared)
+                part.video.Prepare();
+
+            part.speed = 1f;
+        }
+    }
+
+    /// <summary>
+    /// Populate <see cref="videoParts"/> when none were assigned in the inspector: prefer a
+    /// scene <see cref="ARMEEnsembleSyncPlayer"/> (its parts already map video↔WAV↔onset),
+    /// otherwise fall back to discovering VideoPlayers (video-only — use the editor auto-wire
+    /// to attach audio/onset by name).
+    /// </summary>
+    private void ImportPartsFromScene()
+    {
+        videoParts = new List<VideoPart>();
+
+        var syncs = FindObjectsByType<ARMEEnsembleSyncPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (syncs.Length > 0 && syncs[0].parts != null && syncs[0].parts.Count > 0)
+        {
+            foreach (var p in syncs[0].parts)
+            {
+                if (p == null || p.video == null)
+                    continue;
+                videoParts.Add(new VideoPart
+                {
+                    label = string.IsNullOrEmpty(p.label) ? p.video.name : p.label,
+                    video = p.video,
+                    audioClip = p.audio,
+                    onsetFile = p.onsetFile,
+                    displayRenderer = p.displayRenderer
+                });
+            }
+            Log($"Imported {videoParts.Count} video part(s) from ARMEEnsembleSyncPlayer.");
+            return;
+        }
+
+        var vps = FindObjectsByType<VideoPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var vp in vps)
+        {
+            if (vp.clip == null)
+                continue;
+            videoParts.Add(new VideoPart { label = vp.clip.name, video = vp });
+        }
+        Log($"Discovered {videoParts.Count} scene VideoPlayer(s) (no audio/onset wired — run the auto-wire context menu).");
+    }
+
+    /// <summary>
+    /// Stop anything else in the scene that drives the same VideoPlayers. The
+    /// <see cref="ARMEEnsembleSyncPlayer"/> ("EnsembleSync") and the stray VideoControllerPrefab
+    /// both Play()/seek videos on their own clock; with this controller also warping them, the
+    /// two fight and the decoder stalls ("videos slow down and stop"). We own the videos now.
+    /// </summary>
+    private void DisableCompetingDrivers()
+    {
+        var ours = new HashSet<VideoPlayer>();
+        foreach (var p in videoParts)
+            if (p != null && p.video != null)
+                ours.Add(p.video);
+
+        foreach (var sync in FindObjectsByType<ARMEEnsembleSyncPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            sync.Stop();          // pause its videos + stop its (native-tempo) WAV sources
+            sync.enabled = false; // and stop its Update from re-driving them
+            Log($"Disabled competing driver '{sync.name}' (ARMEEnsembleSyncPlayer).");
+        }
+
+        foreach (var vp in FindObjectsByType<VideoPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (ours.Contains(vp))
+                continue;
+            vp.playOnAwake = false;
+            if (vp.isPlaying)
+                vp.Stop();
+            Log($"Stopped stray VideoPlayer '{vp.name}' (not one of our parts).");
+        }
+    }
+
+    /// <summary>
+    /// Give a part its own RenderTexture + material instance and bind the video to the
+    /// '_TB' texture, so parts can never share a texture (the "only one video plays" bug).
+    /// Mirrors <see cref="ARMEEnsembleSyncPlayer"/>.
+    /// </summary>
+    private void BindDisplay(VideoPart part)
+    {
+        int w = (part.video.clip != null && part.video.clip.width > 0) ? (int)part.video.clip.width : 1920;
+        int h = (part.video.clip != null && part.video.clip.height > 0) ? (int)part.video.clip.height : 1080;
+
+        part.ownedRT = new RenderTexture(w, h, 0) { name = $"UserStudyRT_{part.label}" };
+        part.ownedRT.Create();
+
+        part.video.renderMode = VideoRenderMode.RenderTexture;
+        part.video.targetTexture = part.ownedRT;
+
+        part.matInstance = part.displayRenderer.material; // .material clones a unique instance
+        if (part.matInstance != null && part.matInstance.HasProperty(videoTextureProperty))
+            part.matInstance.SetTexture(videoTextureProperty, part.ownedRT);
+        else
+            Debug.LogWarning($"[UserStudy] Part '{part.label}': material has no '{videoTextureProperty}' property; video texture not bound.");
+    }
+
+    /// <summary>Parse an onset file (one timestamp per line) into a sorted list of seconds.</summary>
+    private static List<float> ParseOnsets(TextAsset file)
+    {
+        var list = new List<float>();
+        if (file == null)
+            return list;
+
+        foreach (var line in file.text.Split('\n'))
+        {
+            var t = line.Trim();
+            if (t.Length == 0 || t.StartsWith("#"))
+                continue;
+            if (float.TryParse(t, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v) && v >= 0f)
+                list.Add(v);
+        }
+        list.Sort();
+        return list;
+    }
+
+    /// <summary>True once every part's VideoPlayer has finished preparing.</summary>
+    private bool AllVideosPrepared()
+    {
+        foreach (var part in videoParts)
+            if (part != null && part.video != null && !part.video.isPrepared)
+                return false;
+        return true;
+    }
+
+    /// <summary>Start audio + video for every part from the top, in lockstep.</summary>
+    private void StartVideos()
+    {
+        foreach (var part in videoParts)
+        {
+            if (part == null)
+                continue;
+
+            if (part.audio != null)
+                part.audio.StartPlayback();
+
+            if (part.video != null)
+            {
+                part.video.playbackSpeed = 1f;
+                part.video.time = 0.0;
+                part.video.Play();
+            }
+
+            part.speed = 1f;
         }
     }
 
     void Update()
     {
+        // Deferred video start: wait until every clip has prepared (or a timeout) so the
+        // pictures begin together.
+        if (_videosPending)
+        {
+            if (AllVideosPrepared() || Time.time - _videoArmTime > 5f)
+            {
+                _videosPending = false;
+                StartVideos();
+            }
+        }
+
         // If the user changed the mode in the inspector at runtime, re-initialise.
         if (mode != currentMode) InitVirtualsForMode();
 
         HandleUserTap();
         DetectIdleRevert();
         DriveVirtualBlinks();
-        UpdateVisuals();
+
+        // When the user stops tapping (or hasn't started), let the videos free-run at native
+        // speed instead of holding the last warped tempo.
+        bool engaged = VideosEngaged;
+        if (!engaged && _videosWarping)
+            ReleaseVideosToNative();
+        _videosWarping = engaged;
     }
+
+    /// <summary>
+    /// True while the user is actively tapping and the ensemble is following them (Adaptive
+    /// or Agentic). Until then — and after an idle revert — the videos play normally.
+    /// </summary>
+    private bool VideosEngaged => adaptiveMode;
 
     private void HandleUserTap()
     {
@@ -547,7 +791,9 @@ public class ARMEUserStudyController : MonoBehaviour
             if (now < _nextBlinkTime[i]) continue;
 
             float onsetTime = _nextBlinkTime[i];
-            _flashStartTime[i] = onsetTime;
+
+            // Speed-lock this player's video to the user's beat (no-op while not engaged).
+            DriveVideoForOnset(i);
 
             switch (mode)
             {
@@ -641,14 +887,89 @@ public class ARMEUserStudyController : MonoBehaviour
         return z0;
     }
 
-    private void UpdateVisuals()
+    /// <summary>
+    /// Fired on each model beat of virtual player <paramref name="playerIndex"/>: speed-lock
+    /// the video part(s) that player drives to the user's beat. No-op while not engaged, so
+    /// the videos free-run at native speed until the user starts tapping.
+    /// </summary>
+    private void DriveVideoForOnset(int playerIndex)
     {
-        float now = Time.time;
-        for (int i = 1; i < TotalPlayers; i++)
+        // Only follow the user while engaged; otherwise videos free-run at native speed.
+        if (_videosPending || !VideosEngaged || videoParts.Count == 0)
+            return;
+
+        // Cycle parts and players against each other so every part is driven by exactly one
+        // player: part j follows player (j % numVirtualPlayers) + 1. (When there are more
+        // parts than players, a player drives several parts; more players than parts leaves
+        // the surplus players without a video.)
+        for (int j = 0; j < videoParts.Count; j++)
         {
-            float start = _flashStartTime[i];
-            bool blinking = start >= 0f && now >= start && now < start + blinkDuration;
-            _materials[i - 1].color = blinking ? blinkColor : baseColor;
+            if (j % numVirtualPlayers == playerIndex - 1)
+                WarpPart(videoParts[j]);
+        }
+    }
+
+    /// <summary>
+    /// Phase-lock a single part to the user's beat by modulating ONLY its playbackSpeed
+    /// (never seeking, so the picture never jumps). Each model beat we aim the next recorded
+    /// onset ahead of the current position to arrive roughly one user-IOI from now, so the
+    /// musician's onsets converge smoothly onto the user's beat.
+    /// </summary>
+    private void WarpPart(VideoPart part)
+    {
+        if (part == null || part.video == null || !part.video.isPrepared)
+            return;
+        if (part.onsets == null || part.onsets.Count == 0)
+            return;
+
+        float interval = measuredUserIOI;
+        if (interval <= 1e-3f)
+            return; // no tempo estimate yet — leave it playing at its current speed
+
+        float current = (float)part.video.time;
+        float length = part.video.length > 0.0
+            ? (float)part.video.length
+            : part.onsets[part.onsets.Count - 1] + interval;
+
+        float target = NextOnsetAfter(part.onsets, current);
+        float distance = target - current;
+        if (distance <= 1e-3f)
+            distance += length; // wrapped past the last onset; the VideoPlayer loops itself
+
+        float speed = Mathf.Clamp(distance / interval, minPlaybackSpeed, maxPlaybackSpeed);
+        if (part.video.canSetPlaybackSpeed)
+            part.video.playbackSpeed = speed;
+        part.speed = speed;
+
+        // Best-effort audio time-stretch — only once the native controller has actually
+        // initialised, otherwise it logs a warning every beat. Silent until the native DLL
+        // deps (rubberband/samplerate/sleef) are installed.
+        if (part.audio != null && part.audio.IsPlaying)
+        {
+            part.desiredTime += interval;
+            part.audio.ApplyOnsetTimeRatio(target, part.desiredTime);
+        }
+    }
+
+    /// <summary>First onset strictly after <paramref name="t"/>, or the first onset (wrap).</summary>
+    private static float NextOnsetAfter(List<float> onsets, float t)
+    {
+        foreach (float o in onsets)
+            if (o > t + 1e-3f)
+                return o;
+        return onsets[0];
+    }
+
+    /// <summary>Drop every part back to native (1×) playback when the user stops following.</summary>
+    private void ReleaseVideosToNative()
+    {
+        foreach (var part in videoParts)
+        {
+            if (part == null || part.video == null)
+                continue;
+            if (part.video.canSetPlaybackSpeed)
+                part.video.playbackSpeed = 1f;
+            part.speed = 1f;
         }
     }
 
@@ -681,17 +1002,114 @@ public class ARMEUserStudyController : MonoBehaviour
             _onsetCounts[i] = 0;
             _pendingBlinkTime[i] = -1f;
         }
+
+        // Rewind every video part back to the top.
+        foreach (var part in videoParts)
+        {
+            if (part == null)
+                continue;
+            if (part.audio != null) part.audio.ResetPlayback();
+            if (part.video != null)
+            {
+                part.video.playbackSpeed = 1f;
+                part.video.time = 0.0;
+                part.video.Play();
+            }
+            part.speed = 1f;
+            part.desiredTime = 0f;
+        }
+        _videosWarping = false;
+
         InitVirtualsForMode();
         Log($"RESET complete. Mode={mode}.");
     }
 
     void OnDestroy()
     {
-        if (_materials != null)
+        foreach (var part in videoParts)
         {
-            foreach (var m in _materials)
-                if (m != null) Destroy(m);
+            if (part == null)
+                continue;
+            if (part.video != null) part.video.Pause();
+            if (part.ownedRT != null)
+            {
+                part.ownedRT.Release();
+                Destroy(part.ownedRT);
+            }
+            if (part.matInstance != null)
+                Destroy(part.matInstance);
         }
         _model?.Dispose();
     }
+
+#if UNITY_EDITOR
+    /// <summary>
+    /// Populate <see cref="videoParts"/> from the VideoPlayers in the open scene, matching
+    /// each clip to its WAV and -CRNNManual onset file by name (strip the _TB suffix) plus
+    /// its VideoPlayerPlane display renderer. Run from the component's context menu (gear
+    /// icon) in Edit mode. Lets the study run without an ARMEEnsembleSyncPlayer in the scene.
+    /// </summary>
+    [ContextMenu("Auto-Wire Video Parts From Scene Videos")]
+    private void AutoWireVideoPartsFromSceneVideos()
+    {
+        var videoPlayers = FindObjectsByType<VideoPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (videoPlayers.Length == 0)
+        {
+            Debug.LogWarning("[UserStudy] Auto-wire: no VideoPlayer found in the scene.");
+            return;
+        }
+
+        videoParts.Clear();
+        var seen = new HashSet<string>();
+
+        foreach (var vp in videoPlayers)
+        {
+            if (vp.clip == null)
+                continue;
+
+            string baseName = vp.clip.name;
+            if (baseName.EndsWith("_TB"))
+                baseName = baseName.Substring(0, baseName.Length - 3);
+
+            if (!seen.Add(baseName))
+                continue; // skip a duplicate VideoPlayer pointing at the same piece
+
+            AudioClip clip = FindAsset<AudioClip>(baseName, AudioFolder);
+            TextAsset onset = FindAsset<TextAsset>(baseName + "-CRNNManual", AudioFolder);
+
+            if (clip == null)
+                Debug.LogWarning($"[UserStudy] Auto-wire: no audio clip named '{baseName}' in {AudioFolder}.");
+
+            // Match the display plane by name: TopBottomVideoRender (N) -> VideoPlayerPlane (N).
+            Renderer planeRenderer = null;
+            string planeName = vp.gameObject.name.Replace("TopBottomVideoRender", "VideoPlayerPlane");
+            var planeGO = GameObject.Find(planeName);
+            if (planeGO != null)
+                planeRenderer = planeGO.GetComponent<Renderer>();
+
+            videoParts.Add(new VideoPart
+            {
+                label = baseName,
+                video = vp,
+                audioClip = clip,
+                onsetFile = onset,
+                displayRenderer = planeRenderer
+            });
+        }
+
+        UnityEditor.EditorUtility.SetDirty(this);
+        Debug.Log($"[UserStudy] Auto-wire complete: {videoParts.Count} video part(s).");
+    }
+
+    private static T FindAsset<T>(string assetName, string folder) where T : UnityEngine.Object
+    {
+        foreach (string guid in UnityEditor.AssetDatabase.FindAssets($"t:{typeof(T).Name}", new[] { folder }))
+        {
+            string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
+            if (System.IO.Path.GetFileNameWithoutExtension(path) == assetName)
+                return UnityEditor.AssetDatabase.LoadAssetAtPath<T>(path);
+        }
+        return null;
+    }
+#endif
 }
