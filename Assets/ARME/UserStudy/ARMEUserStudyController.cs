@@ -101,9 +101,9 @@ public enum SyncTightness
 }
 
 /// <summary>
-/// One musician video driven by the timing model: a <see cref="VideoPlayer"/> (picture),
-/// its audio routed through an <see cref="ARMEOnsetBasedPlaybackController"/> (time-stretch),
-/// and the recorded onset times used to warp it onto the model's beat.
+/// One musician video driven by the timing model: a <see cref="VideoPlayer"/> (picture) and
+/// its audio (.wav) played on a plain <see cref="AudioSource"/>, both speed-matched to the
+/// user's tapped tempo. The recorded onset times are parsed for reference/alignment.
 /// </summary>
 [System.Serializable]
 public class VideoPart
@@ -124,10 +124,9 @@ public class VideoPart
     public Renderer displayRenderer;
 
     // ── Runtime state (not serialized) ───────────────────────────────────
-    [System.NonSerialized] public ARMEOnsetBasedPlaybackController audio;
+    [System.NonSerialized] public AudioSource audioSource;   // plays the .wav directly (DLL-free); pitch tracks tempo
     [System.NonSerialized] public List<float> onsets;
-    [System.NonSerialized] public float speed;            // current video playbackSpeed
-    [System.NonSerialized] public float desiredTime;      // cumulative desired time for the (silent) audio path
+    [System.NonSerialized] public float speed;            // last playbackSpeed written to the video
     [System.NonSerialized] public RenderTexture ownedRT;
     [System.NonSerialized] public Material matInstance;
 }
@@ -159,11 +158,20 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private string videoTextureProperty = "_TB";
 
     [BoxGroup("Videos")]
-    [Tooltip("Clamp on the video playback speed while following the user. The video is sped up/slowed so its next onset lands one user-IOI ahead; this bounds how extreme that gets.")]
-    [SerializeField, Range(0.1f, 1f)] private float minPlaybackSpeed = 0.25f;
+    [Tooltip("Tempo (BPM) at which the recordings play at their normal 1x speed. Tap at this rate and the video plays natively; tapping faster/slower scales the playback speed proportionally.")]
+    [SerializeField, Range(40f, 220f)] private float naturalBPM = 120f;
 
     [BoxGroup("Videos")]
-    [SerializeField, Range(1f, 4f)] private float maxPlaybackSpeed = 3f;
+    [Tooltip("Lower clamp on the video playback speed while following the user (fraction of native speed). No matter how slowly you tap, the video won't go below this.")]
+    [SerializeField, Range(0.1f, 1f)] private float minPlaybackSpeed = 0.5f;
+
+    [BoxGroup("Videos")]
+    [Tooltip("Upper clamp on the video playback speed while following the user (multiple of native speed). No matter how fast you tap, the video won't go above this.")]
+    [SerializeField, Range(1f, 4f)] private float maxPlaybackSpeed = 1.2f;
+
+    [BoxGroup("Videos")]
+    [Tooltip("How quickly the videos ease to a new tempo when your tapping speed changes (higher = snappier, lower = smoother). Ramping avoids jolting the decoder and audio on every tap.")]
+    [SerializeField, Range(1f, 20f)] private float speedSmoothRate = 6f;
 
     [BoxGroup("Random Mode")]
     [Tooltip("Minimum random blink interval (seconds) when in Random mode (no recent user input).")]
@@ -258,7 +266,7 @@ public class ARMEUserStudyController : MonoBehaviour
     // pictures begin together with the audio.
     private bool _videosPending;
     private float _videoArmTime;
-    private bool _videosWarping;   // were the videos following the user last frame?
+    private float _ensembleSpeed = 1f;   // shared, smoothly-ramped playback speed for every part
     private float _previousUserTapTime = -1f;
     private bool _haveSpawnGaussian;
     private float _spareGaussian;
@@ -357,9 +365,8 @@ public class ARMEUserStudyController : MonoBehaviour
 
     /// <summary>
     /// Bind the virtual players to the scene's musician videos (replaces sphere spawning).
-    /// Each part gets an <see cref="ARMEOnsetBasedPlaybackController"/> for time-stretched
-    /// audio (which also parses the onset file), and its display is bound so each plane
-    /// shows its own clip.
+    /// Each part gets a plain <see cref="AudioSource"/> playing its .wav (DLL-free), its onset
+    /// file is parsed, and its display is bound so each plane shows its own clip.
     /// </summary>
     private void BindVideoParts()
     {
@@ -376,33 +383,30 @@ public class ARMEUserStudyController : MonoBehaviour
             if (part == null || part.video == null)
                 continue;
 
-            // Audio path: an AudioSource drives the playback controller's OnAudioFilterRead.
-            // The controller also parses the onset file, which we read back for the warp.
+            // Audio path: play the .wav directly through a plain AudioSource (no native DLL
+            // needed). Its pitch is matched to the video's playback speed so sound and picture
+            // stay locked to the tapped tempo. (The native time-stretch controller would hold
+            // pitch constant, but it needs rubberband/samplerate/sleef in Assets/Plugins/.)
+            part.onsets = ParseOnsets(part.onsetFile);
             if (part.audioClip != null)
             {
                 var go = new GameObject($"Audio_{part.label}");
                 go.transform.SetParent(transform, false);
 
                 var src = go.AddComponent<AudioSource>();
-                src.playOnAwake = true;
-                src.spatialBlend = 0f;
-                src.clip = null;
-
-                part.audio = go.AddComponent<ARMEOnsetBasedPlaybackController>();
-                part.audio.Configure(part.audioClip, part.onsetFile);
-                part.onsets = part.audio.GetOriginalOnsetTimes();
-            }
-            else
-            {
-                part.onsets = ParseOnsets(part.onsetFile);
+                src.clip = part.audioClip;
+                src.playOnAwake = false;
+                src.loop = false;          // play once
+                src.spatialBlend = 0f;     // 2D — no positional attenuation
+                part.audioSource = src;
             }
 
-            // Configure the VideoPlayer. It loops and plays at native speed on its own; we
-            // only modulate playbackSpeed to lock it to the user's beat (never seek -> never
-            // snaps). Sound comes from the WAV, not the clip.
+            // Configure the VideoPlayer. Plays once at native speed; we only modulate
+            // playbackSpeed to follow the tapped tempo (never seek -> the picture never snaps).
+            // Sound comes from the WAV (the _TB clip has no audio track).
             part.video.audioOutputMode = VideoAudioOutputMode.None;
             part.video.playOnAwake = false;
-            part.video.isLooping = true;
+            part.video.isLooping = false;   // play once, no repeat
             part.video.skipOnDrop = true;
             part.video.playbackSpeed = 1f;
 
@@ -538,16 +542,21 @@ public class ARMEUserStudyController : MonoBehaviour
         return true;
     }
 
-    /// <summary>Start audio + video for every part from the top, in lockstep.</summary>
+    /// <summary>Start audio + video for every part from the top, in lockstep at native speed.</summary>
     private void StartVideos()
     {
+        _ensembleSpeed = 1f;
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
 
-            if (part.audio != null)
-                part.audio.StartPlayback();
+            if (part.audioSource != null)
+            {
+                part.audioSource.pitch = 1f;
+                part.audioSource.time = 0f;
+                part.audioSource.Play();
+            }
 
             if (part.video != null)
             {
@@ -580,12 +589,9 @@ public class ARMEUserStudyController : MonoBehaviour
         DetectIdleRevert();
         DriveVirtualBlinks();
 
-        // When the user stops tapping (or hasn't started), let the videos free-run at native
-        // speed instead of holding the last warped tempo.
-        bool engaged = VideosEngaged;
-        if (!engaged && _videosWarping)
-            ReleaseVideosToNative();
-        _videosWarping = engaged;
+        // Drive every part at one shared, smoothly-ramped tempo (follows the user while
+        // engaged, eases back to native 1× otherwise).
+        UpdateEnsembleTempo();
     }
 
     /// <summary>
@@ -792,9 +798,6 @@ public class ARMEUserStudyController : MonoBehaviour
 
             float onsetTime = _nextBlinkTime[i];
 
-            // Speed-lock this player's video to the user's beat (no-op while not engaged).
-            DriveVideoForOnset(i);
-
             switch (mode)
             {
                 case EnsembleMode.NonAdaptive:
@@ -888,88 +891,41 @@ public class ARMEUserStudyController : MonoBehaviour
     }
 
     /// <summary>
-    /// Fired on each model beat of virtual player <paramref name="playerIndex"/>: speed-lock
-    /// the video part(s) that player drives to the user's beat. No-op while not engaged, so
-    /// the videos free-run at native speed until the user starts tapping.
+    /// Drive the whole ensemble — every video part and its audio — at ONE shared playback
+    /// speed, smoothly ramped toward the target so tempo changes don't jolt the decoder or the
+    /// audio. While engaged the target is the user's tapped tempo (currentUserBPM / naturalBPM);
+    /// otherwise it eases back to native 1×. Giving every part the identical speed keeps the
+    /// quartet locked together (the four clips are one synchronized recording). The video pitch
+    /// follows via AudioSource.pitch so sound and picture stay in step.
     /// </summary>
-    private void DriveVideoForOnset(int playerIndex)
+    private void UpdateEnsembleTempo()
     {
-        // Only follow the user while engaged; otherwise videos free-run at native speed.
-        if (_videosPending || !VideosEngaged || videoParts.Count == 0)
+        if (_videosPending || videoParts.Count == 0)
             return;
 
-        // Cycle parts and players against each other so every part is driven by exactly one
-        // player: part j follows player (j % numVirtualPlayers) + 1. (When there are more
-        // parts than players, a player drives several parts; more players than parts leaves
-        // the surplus players without a video.)
-        for (int j = 0; j < videoParts.Count; j++)
-        {
-            if (j % numVirtualPlayers == playerIndex - 1)
-                WarpPart(videoParts[j]);
-        }
-    }
+        float target = (VideosEngaged && currentUserBPM > 1e-3f)
+            ? Mathf.Clamp(currentUserBPM / naturalBPM, minPlaybackSpeed, maxPlaybackSpeed)
+            : 1f;
 
-    /// <summary>
-    /// Phase-lock a single part to the user's beat by modulating ONLY its playbackSpeed
-    /// (never seeking, so the picture never jumps). Each model beat we aim the next recorded
-    /// onset ahead of the current position to arrive roughly one user-IOI from now, so the
-    /// musician's onsets converge smoothly onto the user's beat.
-    /// </summary>
-    private void WarpPart(VideoPart part)
-    {
-        if (part == null || part.video == null || !part.video.isPrepared)
-            return;
-        if (part.onsets == null || part.onsets.Count == 0)
-            return;
+        _ensembleSpeed = Mathf.Lerp(_ensembleSpeed, target, Time.deltaTime * speedSmoothRate);
+        if (Mathf.Abs(_ensembleSpeed - target) < 0.005f)
+            _ensembleSpeed = target; // settle exactly instead of asymptoting forever
 
-        float interval = measuredUserIOI;
-        if (interval <= 1e-3f)
-            return; // no tempo estimate yet — leave it playing at its current speed
-
-        float current = (float)part.video.time;
-        float length = part.video.length > 0.0
-            ? (float)part.video.length
-            : part.onsets[part.onsets.Count - 1] + interval;
-
-        float target = NextOnsetAfter(part.onsets, current);
-        float distance = target - current;
-        if (distance <= 1e-3f)
-            distance += length; // wrapped past the last onset; the VideoPlayer loops itself
-
-        float speed = Mathf.Clamp(distance / interval, minPlaybackSpeed, maxPlaybackSpeed);
-        if (part.video.canSetPlaybackSpeed)
-            part.video.playbackSpeed = speed;
-        part.speed = speed;
-
-        // Best-effort audio time-stretch — only once the native controller has actually
-        // initialised, otherwise it logs a warning every beat. Silent until the native DLL
-        // deps (rubberband/samplerate/sleef) are installed.
-        if (part.audio != null && part.audio.IsPlaying)
-        {
-            part.desiredTime += interval;
-            part.audio.ApplyOnsetTimeRatio(target, part.desiredTime);
-        }
-    }
-
-    /// <summary>First onset strictly after <paramref name="t"/>, or the first onset (wrap).</summary>
-    private static float NextOnsetAfter(List<float> onsets, float t)
-    {
-        foreach (float o in onsets)
-            if (o > t + 1e-3f)
-                return o;
-        return onsets[0];
-    }
-
-    /// <summary>Drop every part back to native (1×) playback when the user stops following.</summary>
-    private void ReleaseVideosToNative()
-    {
         foreach (var part in videoParts)
         {
-            if (part == null || part.video == null)
+            if (part == null)
                 continue;
-            if (part.video.canSetPlaybackSpeed)
-                part.video.playbackSpeed = 1f;
-            part.speed = 1f;
+
+            // Skip writes once this part already matches — no point spamming the decoder every
+            // frame after the tempo has settled.
+            if (Mathf.Abs(_ensembleSpeed - part.speed) < 0.002f)
+                continue;
+            part.speed = _ensembleSpeed;
+
+            if (part.video != null && part.video.isPrepared && part.video.canSetPlaybackSpeed)
+                part.video.playbackSpeed = _ensembleSpeed;
+            if (part.audioSource != null)
+                part.audioSource.pitch = _ensembleSpeed;
         }
     }
 
@@ -1003,12 +959,18 @@ public class ARMEUserStudyController : MonoBehaviour
             _pendingBlinkTime[i] = -1f;
         }
 
-        // Rewind every video part back to the top.
+        // Rewind every video + audio part back to the top.
+        _ensembleSpeed = 1f;
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
-            if (part.audio != null) part.audio.ResetPlayback();
+            if (part.audioSource != null)
+            {
+                part.audioSource.pitch = 1f;
+                part.audioSource.time = 0f;
+                part.audioSource.Play();
+            }
             if (part.video != null)
             {
                 part.video.playbackSpeed = 1f;
@@ -1016,9 +978,7 @@ public class ARMEUserStudyController : MonoBehaviour
                 part.video.Play();
             }
             part.speed = 1f;
-            part.desiredTime = 0f;
         }
-        _videosWarping = false;
 
         InitVirtualsForMode();
         Log($"RESET complete. Mode={mode}.");

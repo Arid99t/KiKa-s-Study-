@@ -553,6 +553,27 @@ namespace ARMEPlayback
         }
 
         /// <summary>
+        /// Set a constant playback speed (time-stretch ratio) directly: 1.0 = normal,
+        /// 2.0 = double tempo, 0.5 = half tempo. Used for simple tempo-following where the
+        /// whole recording is scaled to a tempo rather than warped onset-by-onset.
+        /// </summary>
+        public void SetSpeed(float speed)
+        {
+            if (!_isInitialized || _playbackController == null)
+                return;
+
+            try
+            {
+                _playbackController.TimeRatio = Mathf.Max(0.01f, speed);
+                currentTimeRatio = _playbackController.TimeRatio;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[{gameObject.name}] Failed to set speed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Update the current onset index
         /// Used by ensemble controller to track progress through onset sequence
         /// </summary>
