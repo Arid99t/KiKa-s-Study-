@@ -198,8 +198,8 @@ namespace ARMEPlayback
         }
 
         /// <summary>
-        /// Set the time-stretching ratio
-        /// 1.0 = normal speed, 0.5 = half speed, 2.0 = double speed
+        /// Set the native time-stretching ratio.
+        /// 1.0 = normal duration, 0.5 = double playback speed, 2.0 = half playback speed.
         /// </summary>
         public float TimeRatio
         {

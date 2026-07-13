@@ -327,21 +327,7 @@ public class ARMEEnsembleSyncPlayer : MonoBehaviour
             _loopPeriod = 1.0;
     }
 
-    private static float ParseFirstOnset(TextAsset onsetFile)
-    {
-        if (onsetFile == null)
-            return 0f;
-
-        foreach (var line in onsetFile.text.Split('\n'))
-        {
-            var t = line.Trim();
-            if (t.Length == 0 || t.StartsWith("#"))
-                continue;
-            if (float.TryParse(t, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v) && v >= 0f)
-                return v;
-        }
-        return 0f;
-    }
+    private static float ParseFirstOnset(TextAsset onsetFile) => ARMEOnsetUtil.ParseFirst(onsetFile);
 
 #if UNITY_EDITOR
     /// <summary>
@@ -369,9 +355,7 @@ public class ARMEEnsembleSyncPlayer : MonoBehaviour
             if (vp.clip == null)
                 continue;
 
-            string baseName = vp.clip.name;
-            if (baseName.EndsWith("_TB"))
-                baseName = baseName.Substring(0, baseName.Length - 3);
+            string baseName = ARMEEditorAssetUtil.StripTopBottomSuffix(vp.clip.name);
 
             if (!seen.Add(baseName))
                 continue; // skip a duplicate VideoPlayer pointing at the same piece
@@ -402,14 +386,6 @@ public class ARMEEnsembleSyncPlayer : MonoBehaviour
     }
 
     private static T FindAsset<T>(string assetName, string folder) where T : UnityEngine.Object
-    {
-        foreach (string guid in UnityEditor.AssetDatabase.FindAssets($"t:{typeof(T).Name}", new[] { folder }))
-        {
-            string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
-            if (System.IO.Path.GetFileNameWithoutExtension(path) == assetName)
-                return UnityEditor.AssetDatabase.LoadAssetAtPath<T>(path);
-        }
-        return null;
-    }
+        => ARMEEditorAssetUtil.FindAsset<T>(assetName, folder);
 #endif
 }

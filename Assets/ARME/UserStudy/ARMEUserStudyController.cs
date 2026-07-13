@@ -12,9 +12,21 @@ public struct SessionConfig
 {
     public int numVirtualPlayers;
     public EnsembleMode startMode;
+    public Modality modality;
     public float alpha, beta, userIoiSmoothing;
     public float fixedBPM;
     public float agenticIoiVariation, agenticTimingNoise, agenticBaselinePull;
+}
+
+/// <summary>
+/// Sensory modality factor of the 2×3 study design.
+///   AudioOnly   — the participant only hears the ensemble (musician videos hidden).
+///   AudioVisual — the participant hears AND sees the ensemble (musician videos shown).
+/// </summary>
+public enum Modality
+{
+    AudioOnly,
+    AudioVisual
 }
 
 /// <summary>Payload fired when the user taps.</summary>
@@ -114,7 +126,7 @@ public class VideoPart
     [Tooltip("VideoPlayer that shows this part's clip. Its playbackSpeed is warped to the model's onsets.")]
     public VideoPlayer video;
 
-    [Tooltip("This part's audio (.wav). Routed through the time-stretch playback controller (silent until the native DLL deps are installed).")]
+    [Tooltip("This part's audio (.wav). Routed through the native ARME playback controller for pitch-preserved time-stretch (tempo follows the user's taps; pitch stays natural).")]
     public AudioClip audioClip;
 
     [Tooltip("Onset file (-CRNNManual): one timestamp per line, used to warp the recording onto the user's beat.")]
@@ -124,9 +136,14 @@ public class VideoPart
     public Renderer displayRenderer;
 
     // ── Runtime state (not serialized) ───────────────────────────────────
-    [System.NonSerialized] public AudioSource audioSource;   // plays the .wav directly (DLL-free); pitch tracks tempo
+    [System.NonSerialized] public AudioSource audioSource;   // hosts Unity's DSP filter chain; the native controller fills it
+    [System.NonSerialized] public ARMEOnsetBasedPlaybackController playback; // pitch-preserving time-stretch (ARME native lib)
     [System.NonSerialized] public List<float> onsets;
     [System.NonSerialized] public float speed;            // last playbackSpeed written to the video
+    [System.NonSerialized] public float baseSpeed;        // smoothed tempo (before the immediate phase-alignment nudge)
+    [System.NonSerialized] public float tempoOffset;      // per-player starting tempo delta (fraction), shrinks as the ensemble converges
+    [System.NonSerialized] public bool  finished;         // audio content exhausted this take (take-end follows the audio, not the longer video)
+    [System.NonSerialized] public float audioElapsed;     // source seconds the audio stretcher has consumed this take (≈ audio playhead)
     [System.NonSerialized] public RenderTexture ownedRT;
     [System.NonSerialized] public Material matInstance;
 }
@@ -140,6 +157,18 @@ public class ARMEUserStudyController : MonoBehaviour
     [BoxGroup("Mode")]
     [Tooltip("Experimental condition for this run.")]
     [SerializeField] private EnsembleMode mode = EnsembleMode.Adaptive;
+
+    [BoxGroup("Mode")]
+    [Tooltip("Sensory modality for this run. AudioOnly hides the musician videos (audio still plays); AudioVisual shows them.")]
+    [SerializeField] private Modality modality = Modality.AudioVisual;
+
+    [BoxGroup("Experiment Flow")]
+    [Tooltip("When false, the controller waits for an ARMEUserStudyExperimentUI to call BeginPlayback() (welcome screen -> count-in -> start) instead of auto-playing the videos on scene load. Auto-set to false at runtime whenever an experiment UI is present in the scene.")]
+    [SerializeField] private bool autoStart = true;
+
+    [BoxGroup("Input")]
+    [Tooltip("Optional Teensy FSR tap sensor. When assigned (or auto-found), its hardware taps register as the user's beat taps, alongside mouse clicks. Leave empty to use mouse only.")]
+    [SerializeField] private ARMETapDetection tapDetection;
 
     [BoxGroup("Virtual Players")]
     [Tooltip("How many virtual players the timing model runs. Each is mapped (cycling) to one of the scene's video parts. For independent per-musician warp, set this equal to the number of video parts (≤4).")]
@@ -160,6 +189,10 @@ public class ARMEUserStudyController : MonoBehaviour
     [BoxGroup("Videos")]
     [Tooltip("Tempo (BPM) at which the recordings play at their normal 1x speed. Tap at this rate and the video plays natively; tapping faster/slower scales the playback speed proportionally.")]
     [SerializeField, Range(40f, 220f)] private float naturalBPM = 120f;
+
+    [BoxGroup("Videos")]
+    [Tooltip("Baseline playback rate applied to the recordings' native speed (1 = original, 0.9 = 10% slower). Scales both the idle/native tempo and the user-followed tempo.")]
+    [SerializeField, Range(0.25f, 1.5f)] private float normalPlaybackRate = 0.9f;
 
     [BoxGroup("Videos")]
     [Tooltip("Lower clamp on the video playback speed while following the user (fraction of native speed). No matter how slowly you tap, the video won't go below this.")]
@@ -194,7 +227,7 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField, Range(0f, 1f)] private float beta = 0.15f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Smoothing on the user's measured IOI itself. Lower = more reactive, higher = more inertial.")]
+    [Tooltip("Weight given to each new tap when updating the measured tempo (IOI). HIGHER = more reactive (follows your latest tap faster); lower = more inertial/stable. ~0.6 feels responsive without jitter.")]
     [SerializeField, Range(0f, 1f)] private float userIoiSmoothing = 0.30f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
@@ -233,6 +266,22 @@ public class ARMEUserStudyController : MonoBehaviour
     [Tooltip("Reduced period-correction gain in Agentic mode.")]
     [SerializeField, Range(0f, 1f)] private float agenticBeta = 0.05f;
 
+    [BoxGroup("Sync Convergence (videos)")]
+    [Tooltip("Each player starts at a slightly different tempo: a random ± fraction of native speed. 0 = all start identical.")]
+    [SerializeField, Range(0f, 0.3f)] private float startTempoSpread = 0.04f;
+
+    [BoxGroup("Sync Convergence (videos)")]
+    [Tooltip("Seconds for the ensemble to pull fully into sync once you start tapping (lower = quicker). The tempo offsets shrink and the players align over this time.")]
+    [SerializeField, Range(0.5f, 15f)] private float convergeSeconds = 4f;
+
+    [BoxGroup("Sync Convergence (videos)")]
+    [Tooltip("How strongly each player's speed is nudged to pull its playback position onto the lead player's (tightens the quartet). Higher = the players lock together faster/firmer. 0 = tempo only, no phase alignment.")]
+    [SerializeField, Range(0f, 4f)] private float phaseCohesionGain = 1.6f;
+
+    [BoxGroup("Sync Convergence (videos)")]
+    [Tooltip("How tightly Agentic locks once converged (1 = as tight as Adaptive). Below 1 keeps a residual tempo/phase spread so Agentic stays a bit loose.")]
+    [SerializeField, Range(0f, 1f)] private float agenticMaxConvergence = 0.55f;
+
     [BoxGroup("Logging")]
     [SerializeField] private bool verboseLogging = true;
 
@@ -266,7 +315,8 @@ public class ARMEUserStudyController : MonoBehaviour
     // pictures begin together with the audio.
     private bool _videosPending;
     private float _videoArmTime;
-    private float _ensembleSpeed = 1f;   // shared, smoothly-ramped playback speed for every part
+    private float _ensembleSpeed = 1f;   // average applied playback speed (for the HUD readout)
+    private float _convergence = 0f;     // 0 = full starting offset (loose), 1 = fully pulled into sync
     private float _previousUserTapTime = -1f;
     private bool _haveSpawnGaussian;
     private float _spareGaussian;
@@ -279,6 +329,27 @@ public class ARMEUserStudyController : MonoBehaviour
     private int _currentBeatIndex;
     private float[] _pendingBlinkTime;    // virtual's most recent blink time awaiting a beat slot (-1 = none)
 
+    // ── Experiment flow (driven by ARMEUserStudyExperimentUI) ────────────
+    private bool _externalControl;   // an experiment UI owns when playback starts/repeats
+    private bool _playbackActive;    // a take is currently playing (for end detection)
+    private int  _finishedParts;     // how many parts have reached their end this take
+
+    /// <summary>While false, user taps are ignored (e.g. on the welcome screen).</summary>
+    [System.NonSerialized] public bool AcceptTaps = true;
+
+    /// <summary>Fired once when every video part has played to its end (for count-in + repeat).</summary>
+    public event System.Action OnPlaybackEnded;
+
+    /// <summary>Fired when a take's audio/video actually starts (after the count-in). Lets the data
+    /// logger bound the synchronisation window to real playback and exclude count-in blinks.</summary>
+    public event System.Action OnPlaybackStarted;
+
+    // Read-only accessors for the experiment UI / HUD.
+    public EnsembleMode Mode => mode;
+    public Modality CurrentModality => modality;
+    public int VirtualPlayerCount => numVirtualPlayers;
+    public float EnsembleSpeed => _ensembleSpeed;
+
     // ── Data Logging Events ──────────────────────────────────────────────
     public event System.Action<UserStudyTapEvent>   OnUserTap;
     public event System.Action<UserStudyBlinkEvent> OnVirtualBlink;
@@ -289,6 +360,7 @@ public class ARMEUserStudyController : MonoBehaviour
     {
         numVirtualPlayers   = numVirtualPlayers,
         startMode           = mode,
+        modality            = modality,
         alpha               = alpha,
         beta                = beta,
         userIoiSmoothing    = userIoiSmoothing,
@@ -302,9 +374,9 @@ public class ARMEUserStudyController : MonoBehaviour
 
     void Start()
     {
-        _model = new SimpleTimingModel(TotalPlayers);
-        _model.CreateNewParameters();
-
+        // Allocate state FIRST so a missing/incompatible native timing-model library can never
+        // leave these arrays null (that caused a NullReferenceException every frame in
+        // DriveVirtualBlinks on macOS, where the bundled Windows .dll's can't load).
         _virtualIOI = new float[TotalPlayers];
         _virtualBaselineIOI = new float[TotalPlayers];
         _nextBlinkTime = new float[TotalPlayers];
@@ -313,15 +385,46 @@ public class ARMEUserStudyController : MonoBehaviour
         for (int i = 0; i < TotalPlayers; i++) _pendingBlinkTime[i] = -1f;
         _currentBeatIndex = 0;
 
+        // The ARME timing model needs a native plugin; the bundled libraries are Windows .dll's,
+        // so on macOS/Linux model creation throws. Fall back to tap-tempo sync, which does NOT
+        // need the native model: the video speed follows the user's measured BPM and the virtual
+        // blinks use the IOI fallback in ApplyCorrections.
+        try
+        {
+            _model = new SimpleTimingModel(TotalPlayers);
+            _model.CreateNewParameters();
+        }
+        catch (System.Exception ex)
+        {
+            _model = null;
+            Debug.LogWarning($"[UserStudy] Native timing model unavailable ({ex.Message}). " +
+                             "Running in tap-tempo fallback — videos still follow your taps.");
+        }
+
         BindVideoParts();
         InitVirtualsForMode();
 
-        // Defer the actual video/audio start until every clip has finished preparing.
-        _videosPending = true;
-        _videoArmTime = Time.time;
+        // If an experiment UI is present (welcome screen + count-in + repeat) it decides when
+        // playback begins; otherwise auto-start once every clip has finished preparing.
+        _externalControl = !autoStart || FindFirstObjectByType<ARMEUserStudyExperimentUI>() != null;
+        if (!_externalControl)
+        {
+            _videosPending = true;
+            _videoArmTime = Time.time;
+        }
 
+        // Hook up the Teensy FSR sensor (if present) so its presses count as user beat taps.
+        if (tapDetection == null) tapDetection = FindFirstObjectByType<ARMETapDetection>();
+        if (tapDetection != null)
+        {
+            tapDetection.OnHardwareTap += HandleHardwareTap;
+            Log("FSR tap sensor connected — hardware presses will register as user taps.");
+        }
+
+        string libVersion;
+        try { libVersion = SimpleTimingModel.GetVersion(); } catch { libVersion = "unavailable"; }
         Log($"Ready. Players: {TotalPlayers} (P0=user, P1..P{numVirtualPlayers}=virtual). " +
-            $"Videos: {videoParts.Count}. Mode={mode}. alpha={alpha:F2}, beta={beta:F2}. Lib v{SimpleTimingModel.GetVersion()}");
+            $"Videos: {videoParts.Count}. Mode={mode}. alpha={alpha:F2}, beta={beta:F2}. Lib v{libVersion}");
     }
 
     /// <summary>
@@ -383,22 +486,27 @@ public class ARMEUserStudyController : MonoBehaviour
             if (part == null || part.video == null)
                 continue;
 
-            // Audio path: play the .wav directly through a plain AudioSource (no native DLL
-            // needed). Its pitch is matched to the video's playback speed so sound and picture
-            // stay locked to the tapped tempo. (The native time-stretch controller would hold
-            // pitch constant, but it needs rubberband/samplerate/sleef in Assets/Plugins/.)
+            // Audio path: route the .wav through the native ARME playback controller, which
+            // time-stretches it with PITCH PRESERVED (Rubber Band, baked into the macOS dylib).
+            // The AudioSource only hosts Unity's DSP filter chain; the controller fills it in
+            // OnAudioFilterRead. Tempo is driven per frame from UpdateEnsembleTempo via SetSpeed,
+            // so sound and picture stay locked to the tapped tempo without the chipmunk effect.
             part.onsets = ParseOnsets(part.onsetFile);
             if (part.audioClip != null)
             {
                 var go = new GameObject($"Audio_{part.label}");
                 go.transform.SetParent(transform, false);
 
+                // A playing, clip-less AudioSource is what makes Unity call the controller's
+                // OnAudioFilterRead each audio block.
                 var src = go.AddComponent<AudioSource>();
-                src.clip = part.audioClip;
-                src.playOnAwake = false;
-                src.loop = false;          // play once
+                src.clip = null;
+                src.playOnAwake = true;
                 src.spatialBlend = 0f;     // 2D — no positional attenuation
                 part.audioSource = src;
+
+                part.playback = go.AddComponent<ARMEOnsetBasedPlaybackController>();
+                part.playback.Configure(part.audioClip, part.onsetFile);
             }
 
             // Configure the VideoPlayer. Plays once at native speed; we only modulate
@@ -416,8 +524,85 @@ public class ARMEUserStudyController : MonoBehaviour
             if (!part.video.isPrepared)
                 part.video.Prepare();
 
+            // End-of-take detection for count-in + repeat (fires only when isLooping == false).
+            part.video.loopPointReached -= OnPartReachedEnd;
+            part.video.loopPointReached += OnPartReachedEnd;
+
             part.speed = 1f;
         }
+
+        // Honour the configured modality from the start (hide videos in AudioOnly).
+        ApplyModalityVisibility();
+    }
+
+    /// <summary>Count parts that have a VideoPlayer (denominator for end-of-take detection).</summary>
+    private int PartCount()
+    {
+        int n = 0;
+        foreach (var p in videoParts)
+            if (p != null && p.video != null) n++;
+        return n;
+    }
+
+    /// <summary>The video reached its end (used when a video clip is shorter than its audio).</summary>
+    private void OnPartReachedEnd(VideoPlayer vp)
+    {
+        if (!_playbackActive) return;
+        MarkPartFinished(FindPart(vp));
+        MaybeEndTake();
+    }
+
+    /// <summary>Find the part that owns a given VideoPlayer (for loopPointReached callbacks).</summary>
+    private VideoPart FindPart(VideoPlayer vp)
+    {
+        foreach (var p in videoParts)
+            if (p != null && p.video == vp) return p;
+        return null;
+    }
+
+    /// <summary>
+    /// A part is done the moment its AUDIO content is exhausted (or its video reaches the end,
+    /// whichever comes first). Freeze the picture on its last frame and silence any residual
+    /// audio so sound and picture stop together — the take follows the audio, not the (often
+    /// slightly longer) video clip.
+    /// </summary>
+    private void MarkPartFinished(VideoPart part)
+    {
+        if (part == null || part.finished) return;
+        part.finished = true;
+        _finishedParts++;
+        if (part.video != null)    part.video.Pause();          // freeze the picture where the sound stopped
+        if (part.playback != null) part.playback.StopPlayback(); // silence any residual audio
+    }
+
+    /// <summary>End the take once every part has finished.</summary>
+    private void MaybeEndTake()
+    {
+        if (_playbackActive && _finishedParts >= PartCount())
+        {
+            _playbackActive = false;
+            Log("All parts finished (audio ended) — invoking OnPlaybackEnded.");
+            OnPlaybackEnded?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Each frame of an active take, end any part whose audio has played to the end of its clip.
+    /// The stretcher consumes source audio at the same speed the video is warped, so once the
+    /// consumed source (<see cref="VideoPart.audioElapsed"/>) reaches the clip length the sound
+    /// has just finished — that's when the matching video is stopped, so videos end with the audio.
+    /// </summary>
+    private void CheckAudioCompletion()
+    {
+        if (!_playbackActive) return;
+        foreach (var part in videoParts)
+        {
+            if (part == null || part.finished || part.video == null || part.audioClip == null)
+                continue;
+            if (part.audioElapsed >= part.audioClip.length)
+                MarkPartFinished(part);
+        }
+        MaybeEndTake();
     }
 
     /// <summary>
@@ -480,6 +665,16 @@ public class ARMEUserStudyController : MonoBehaviour
             Log($"Disabled competing driver '{sync.name}' (ARMEEnsembleSyncPlayer).");
         }
 
+        // A standalone ARMEOnsetBasedEnsembleController is a SECOND audio engine playing the
+        // same parts (the overlap), and it auto-starts during the count-in. We now drive the
+        // native pitch-preserving playback per part ourselves, so shut any such coordinator down.
+        foreach (var ens in FindObjectsByType<ARMEOnsetBasedEnsembleController>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            ens.StopEnsemblePlayback();
+            ens.enabled = false;
+            Log($"Disabled competing audio engine '{ens.name}' (ARMEOnsetBasedEnsembleController).");
+        }
+
         foreach (var vp in FindObjectsByType<VideoPlayer>(FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
             if (ours.Contains(vp))
@@ -515,23 +710,7 @@ public class ARMEUserStudyController : MonoBehaviour
     }
 
     /// <summary>Parse an onset file (one timestamp per line) into a sorted list of seconds.</summary>
-    private static List<float> ParseOnsets(TextAsset file)
-    {
-        var list = new List<float>();
-        if (file == null)
-            return list;
-
-        foreach (var line in file.text.Split('\n'))
-        {
-            var t = line.Trim();
-            if (t.Length == 0 || t.StartsWith("#"))
-                continue;
-            if (float.TryParse(t, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v) && v >= 0f)
-                list.Add(v);
-        }
-        list.Sort();
-        return list;
-    }
+    private static List<float> ParseOnsets(TextAsset file) => ARMEOnsetUtil.ParseAll(file);
 
     /// <summary>True once every part's VideoPlayer has finished preparing.</summary>
     private bool AllVideosPrepared()
@@ -542,30 +721,48 @@ public class ARMEUserStudyController : MonoBehaviour
         return true;
     }
 
-    /// <summary>Start audio + video for every part from the top, in lockstep at native speed.</summary>
+    /// <summary>
+    /// Start audio + video for every part. Each player gets a small random tempo offset and a
+    /// small random phase (start position) so the ensemble begins slightly out of sync; once the
+    /// user taps, UpdateEnsembleTempo gradually shrinks the offsets and pulls the players together.
+    /// </summary>
     private void StartVideos()
     {
         _ensembleSpeed = 1f;
+        _convergence = 0f;        // start loose; converge only once the user taps
+        _finishedParts = 0;
+        _playbackActive = true;
+        OnPlaybackStarted?.Invoke();
+
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
 
-            if (part.audioSource != null)
+            // Per-player starting tempo offset drives the loose→converged feel. Audio and video
+            // both start from the top so each part's sound and picture stay aligned (the native
+            // stretcher has no per-sample start offset), so the spread is in tempo, not phase.
+            part.tempoOffset = Random.Range(-startTempoSpread, startTempoSpread);
+            float startSpeed = normalPlaybackRate * (1f + part.tempoOffset);
+
+            part.finished = false;      // fresh take: nothing has ended yet
+            part.audioElapsed = 0f;     // audio playhead back at the start
+
+            if (part.playback != null)
             {
-                part.audioSource.pitch = 1f;
-                part.audioSource.time = 0f;
-                part.audioSource.Play();
+                part.playback.RestartFromBeginning();   // rebuild the native stretcher → rewinds to sample 0
+                part.playback.SetSpeed(startSpeed);
             }
 
             if (part.video != null)
             {
-                part.video.playbackSpeed = 1f;
+                part.video.playbackSpeed = startSpeed;
                 part.video.time = 0.0;
                 part.video.Play();
             }
 
-            part.speed = 1f;
+            part.speed = startSpeed;
+            part.baseSpeed = startSpeed;
         }
     }
 
@@ -592,32 +789,71 @@ public class ARMEUserStudyController : MonoBehaviour
         // Drive every part at one shared, smoothly-ramped tempo (follows the user while
         // engaged, eases back to native 1× otherwise).
         UpdateEnsembleTempo();
+
+        // End each part (and the take) when its audio finishes, so videos stop with the sound.
+        CheckAudioCompletion();
     }
 
     /// <summary>
-    /// True while the user is actively tapping and the ensemble is following them (Adaptive
-    /// or Agentic). Until then — and after an idle revert — the videos play normally.
+    /// True while the user is actively tapping and the ensemble should follow their tempo
+    /// (Adaptive or Agentic). Driven directly by a recent tap + a measured tempo rather than
+    /// the adaptiveMode sub-state, so the videos reliably speed up / slow down with the user.
+    /// Non-Adaptive never engages (videos play at their native tempo).
     /// </summary>
-    private bool VideosEngaged => adaptiveMode;
+    private bool VideosEngaged
+    {
+        get
+        {
+            if (mode == EnsembleMode.NonAdaptive) return false;
+            if (currentUserBPM <= 1e-3f) return false;
+
+            float idle = (lastUserTapTime > 0f) ? (Time.time - lastUserTapTime) : float.PositiveInfinity;
+            float threshold = (measuredUserIOI > 0f) ? idleTimeoutFactor * measuredUserIOI : fallbackIdleSeconds;
+            return idle <= threshold;
+        }
+    }
 
     private void HandleUserTap()
     {
+        if (!AcceptTaps) return;   // ignore clicks while the welcome screen is up
+
         var mouse = Mouse.current;
         if (mouse == null || !mouse.leftButton.wasPressedThisFrame) return;
 
-        float t = Time.time;
+        RegisterUserTap(Time.time);
+    }
+
+    /// <summary>
+    /// Fired when the Teensy FSR sensor registers a tap. The event is raised on the main thread
+    /// (dequeued in <see cref="ARMETapDetection.Update"/>), so it can drive the model directly.
+    /// </summary>
+    private void HandleHardwareTap(HardwareTapEvent e)
+    {
+        if (!AcceptTaps) return;
+        RegisterUserTap(Time.time);
+    }
+
+    /// <summary>
+    /// Core beat-tap handling shared by the mouse and the FSR sensor: registers the onset with the
+    /// timing model, measures the user's tempo, and drives the ensemble adaptation.
+    /// </summary>
+    private void RegisterUserTap(float t)
+    {
         userTapCount++;
 
         // Register user onset to the model using an explicit, monotonically increasing
         // beat index. All players' onsets for the same beat share this index so ARME
         // can correlate them as ensemble partners.
         _currentBeatIndex++;
-        try
+        if (_model != null)
         {
-            _model.RegisterOnsetWithIndex(UserPlayerIndex, t, _currentBeatIndex);
-            _onsetCounts[UserPlayerIndex]++;
+            try
+            {
+                _model.RegisterOnsetWithIndex(UserPlayerIndex, t, _currentBeatIndex);
+                _onsetCounts[UserPlayerIndex]++;
+            }
+            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] User onset register failed: {ex.Message}"); }
         }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] User onset register failed: {ex.Message}"); }
 
         // Flush any pending virtual blinks into this beat slot. Virtuals fire on their
         // own clock between user taps; we record the blink time and only commit it to
@@ -625,12 +861,15 @@ public class ARMEUserStudyController : MonoBehaviour
         for (int i = 1; i < TotalPlayers; i++)
         {
             if (_pendingBlinkTime[i] < 0f) continue;
-            try
+            if (_model != null)
             {
-                _model.RegisterOnsetWithIndex(i, _pendingBlinkTime[i], _currentBeatIndex);
-                _onsetCounts[i]++;
+                try
+                {
+                    _model.RegisterOnsetWithIndex(i, _pendingBlinkTime[i], _currentBeatIndex);
+                    _onsetCounts[i]++;
+                }
+                catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} flush register failed: {ex.Message}"); }
             }
-            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} flush register failed: {ex.Message}"); }
             _pendingBlinkTime[i] = -1f;
         }
 
@@ -713,10 +952,15 @@ public class ARMEUserStudyController : MonoBehaviour
     {
         GetEffectiveGains(out float effectiveAlpha, out float effectiveBeta);
 
-        // Get ARME's predictions; these become the phase-correction targets.
+        // Get ARME's predictions; these become the phase-correction targets. When the native
+        // model is unavailable, predictions stay null and the per-player fallback below
+        // (user tap + measured IOI) drives the blinks instead.
         float[] predictions = null;
-        try { predictions = _model.PredictNextOnsets(); }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] PredictNextOnsets failed: {ex.Message}"); }
+        if (_model != null)
+        {
+            try { predictions = _model.PredictNextOnsets(); }
+            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] PredictNextOnsets failed: {ex.Message}"); }
+        }
 
         if (predictions != null)
         {
@@ -860,12 +1104,15 @@ public class ARMEUserStudyController : MonoBehaviour
         float interval = Mathf.Max(0.05f, _virtualIOI[i] + jitter);
 
         // Register to the model so it still informs predictions for any adapting partners.
-        try
+        if (_model != null)
         {
-            _model.RegisterOnset(i, onsetTime);
-            _onsetCounts[i]++;
+            try
+            {
+                _model.RegisterOnset(i, onsetTime);
+                _onsetCounts[i]++;
+            }
+            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} register failed: {ex.Message}"); }
         }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} register failed: {ex.Message}"); }
 
         _nextBlinkTime[i] = onsetTime + interval;
         Log($"P{i} BLINK (agentic) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  jitter={jitter:+0.000;-0.000}s  interval={interval:F3}s  next={_nextBlinkTime[i]:F3}s");
@@ -891,47 +1138,184 @@ public class ARMEUserStudyController : MonoBehaviour
     }
 
     /// <summary>
-    /// Drive the whole ensemble — every video part and its audio — at ONE shared playback
-    /// speed, smoothly ramped toward the target so tempo changes don't jolt the decoder or the
-    /// audio. While engaged the target is the user's tapped tempo (currentUserBPM / naturalBPM);
-    /// otherwise it eases back to native 1×. Giving every part the identical speed keeps the
-    /// quartet locked together (the four clips are one synchronized recording). The video pitch
-    /// follows via AudioSource.pitch so sound and picture stay in step.
+    /// Drive each video part with its OWN speed so the ensemble can start slightly out of sync
+    /// (per-player tempo + phase offset) and then converge gradually once the user taps:
+    ///   • A shared "convergence" value ramps 0→1 while the user is tapping (over convergeSeconds),
+    ///     and back to 0 when idle. Non-Adaptive never converges; Agentic caps below 1 so it stays
+    ///     a bit loose; Adaptive reaches full lock.
+    ///   • Each part targets the user's tempo scaled by its (shrinking) tempo offset, plus a
+    ///     phase-cohesion nudge that pulls its playback position toward the ensemble centre so the
+    ///     quartet tightens up. Audio pitch follows per part so sound and picture stay together.
     /// </summary>
     private void UpdateEnsembleTempo()
     {
         if (_videosPending || videoParts.Count == 0)
             return;
 
-        float target = (VideosEngaged && currentUserBPM > 1e-3f)
+        bool engaged = VideosEngaged;   // recent tap + measured BPM, and not Non-Adaptive
+
+        // How far this mode is allowed to lock in.
+        float maxConvergence = mode == EnsembleMode.NonAdaptive ? 0f
+                             : mode == EnsembleMode.Agentic      ? agenticMaxConvergence
+                                                                 : 1f;
+        float convTarget = engaged ? maxConvergence : 0f;
+        float convStep = convergeSeconds > 0.01f ? Time.deltaTime / convergeSeconds : 1f;
+        _convergence = Mathf.MoveTowards(_convergence, convTarget, convStep);
+
+        // Common tempo target from the user's tapping (native 1× until engaged).
+        float userRatio = (engaged && currentUserBPM > 1e-3f)
             ? Mathf.Clamp(currentUserBPM / naturalBPM, minPlaybackSpeed, maxPlaybackSpeed)
             : 1f;
 
-        _ensembleSpeed = Mathf.Lerp(_ensembleSpeed, target, Time.deltaTime * speedSmoothRate);
-        if (Mathf.Abs(_ensembleSpeed - target) < 0.005f)
-            _ensembleSpeed = target; // settle exactly instead of asymptoting forever
+        // Phase reference = the first prepared part (the "lead" player). Everyone else aligns
+        // their playback position onto the lead, which locks the quartet far more tightly than
+        // chasing a moving average that never quite closes.
+        float leadTime = -1f;
+        foreach (var part in videoParts)
+            if (part?.video != null && part.video.isPrepared) { leadTime = (float)part.video.time; break; }
+
+        float sumSpeed = 0f;
+        int speedCount = 0;
 
         foreach (var part in videoParts)
         {
-            if (part == null)
+            if (part?.video == null || !part.video.isPrepared)
                 continue;
 
-            // Skip writes once this part already matches — no point spamming the decoder every
-            // frame after the tempo has settled.
-            if (Mathf.Abs(_ensembleSpeed - part.speed) < 0.002f)
-                continue;
-            part.speed = _ensembleSpeed;
+            // Smoothed tempo: the per-player offset shrinks toward 0 as the ensemble converges.
+            float offset = part.tempoOffset * (1f - _convergence);
+            float baseTarget = userRatio * (1f + offset) * normalPlaybackRate;
+            part.baseSpeed = Mathf.Lerp(part.baseSpeed, baseTarget, Time.deltaTime * speedSmoothRate);
 
-            if (part.video != null && part.video.isPrepared && part.video.canSetPlaybackSpeed)
-                part.video.playbackSpeed = _ensembleSpeed;
-            if (part.audioSource != null)
-                part.audioSource.pitch = _ensembleSpeed;
+            // Phase alignment is applied ON TOP of the smoothed tempo and immediately (not smoothed),
+            // so a part that's ahead/behind the lead actively catches up instead of asymptoting.
+            float applied = part.baseSpeed;
+            if (mode != EnsembleMode.NonAdaptive && leadTime >= 0f)
+            {
+                float phaseError = (float)part.video.time - leadTime;   // ahead of lead = positive
+                applied -= phaseCohesionGain * _convergence * phaseError;
+            }
+
+            applied = Mathf.Clamp(applied, minPlaybackSpeed, maxPlaybackSpeed);
+            part.speed = applied;
+
+            // Track how much source audio the stretcher has consumed so the take can end with the
+            // audio (see CheckAudioCompletion). Only while a take is actually running.
+            if (_playbackActive && !part.finished)
+                part.audioElapsed += applied * Time.deltaTime;
+
+            part.video.playbackSpeed = applied;
+            if (part.playback != null)
+                part.playback.SetSpeed(applied);   // pitch-preserved time-stretch tracks the video
+
+            sumSpeed += applied;
+            speedCount++;
         }
+
+        _ensembleSpeed = speedCount > 0 ? sumSpeed / speedCount : 1f;   // average, for the HUD
     }
 
     private void Log(string msg)
     {
         if (verboseLogging) Debug.Log("[UserStudy] " + msg);
+    }
+
+    // ── Experiment-UI driven API ─────────────────────────────────────────
+
+    /// <summary>Switch the experimental condition and re-seed the virtuals for it.</summary>
+    public void SetMode(EnsembleMode newMode)
+    {
+        mode = newMode;
+        InitVirtualsForMode();
+        Log($"Mode set to {mode}.");
+    }
+
+    /// <summary>
+    /// Switch the sensory modality. In AudioOnly the musician videos are hidden (their
+    /// display renderers are disabled) while the VideoPlayers keep running — they are still
+    /// the tempo/phase reference in <see cref="UpdateEnsembleTempo"/> and the audio comes from
+    /// the native pitch-preserving playback, not the video. AudioVisual re-shows them.
+    /// </summary>
+    public void SetModality(Modality newModality)
+    {
+        modality = newModality;
+        ApplyModalityVisibility();
+        Log($"Modality set to {modality}.");
+    }
+
+    /// <summary>Show/hide each part's display renderer according to the active modality.</summary>
+    private void ApplyModalityVisibility()
+    {
+        bool visible = modality == Modality.AudioVisual;
+        foreach (var part in videoParts)
+        {
+            if (part != null && part.displayRenderer != null)
+                part.displayRenderer.enabled = visible;
+        }
+    }
+
+    /// <summary>
+    /// Reset the timing model + tap counters for a fresh take. The experiment UI calls this at
+    /// the START of the count-in so the taps the user makes during the count-in accumulate and
+    /// carry into playback (their tempo is ready when the videos begin).
+    /// </summary>
+    public void PrepareForTake() => ResetModelAndCounters();
+
+    /// <summary>
+    /// (Re)start every video part from the top, keeping the tempo already established during the
+    /// count-in. Honours the deferred prepared-check so the pictures begin together.
+    /// </summary>
+    public void BeginPlayback()
+    {
+        _videosPending = true;
+        _videoArmTime = Time.time;
+        Log("BeginPlayback requested.");
+    }
+
+    /// <summary>
+    /// Stop the current take and pause the videos (used by the experiment UI's End button when
+    /// returning to the welcome screen). The next BeginPlayback restarts cleanly from the top.
+    /// </summary>
+    public void StopPlayback()
+    {
+        _playbackActive = false;
+        _videosPending = false;
+        AcceptTaps = false;
+
+        foreach (var part in videoParts)
+        {
+            if (part == null) continue;
+            if (part.video != null) part.video.Pause();
+            if (part.playback != null) part.playback.StopPlayback();
+        }
+
+        Log("StopPlayback requested.");
+    }
+
+    /// <summary>Reset the timing model + user-tap state (without touching the videos).</summary>
+    private void ResetModelAndCounters()
+    {
+        if (_model != null)
+        {
+            try { _model.Reset(); _model.CreateNewParameters(); }
+            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] Reset failed: {ex.Message}"); }
+        }
+
+        userTapCount = 0;
+        currentUserBPM = 0f;
+        measuredUserIOI = 0f;
+        lastUserTapTime = 0f;
+        _previousUserTapTime = -1f;
+        _currentBeatIndex = 0;
+        _ensembleSpeed = 1f;
+
+        for (int i = 0; i < TotalPlayers; i++)
+        {
+            _onsetCounts[i] = 0;
+            _pendingBlinkTime[i] = -1f;
+        }
+
+        InitVirtualsForMode();
     }
 
     [Button("Reset Model & Restart")]
@@ -965,11 +1349,10 @@ public class ARMEUserStudyController : MonoBehaviour
         {
             if (part == null)
                 continue;
-            if (part.audioSource != null)
+            if (part.playback != null)
             {
-                part.audioSource.pitch = 1f;
-                part.audioSource.time = 0f;
-                part.audioSource.Play();
+                part.playback.RestartFromBeginning();
+                part.playback.SetSpeed(1f);
             }
             if (part.video != null)
             {
@@ -986,11 +1369,17 @@ public class ARMEUserStudyController : MonoBehaviour
 
     void OnDestroy()
     {
+        if (tapDetection != null) tapDetection.OnHardwareTap -= HandleHardwareTap;
+
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
-            if (part.video != null) part.video.Pause();
+            if (part.video != null)
+            {
+                part.video.loopPointReached -= OnPartReachedEnd;
+                part.video.Pause();
+            }
             if (part.ownedRT != null)
             {
                 part.ownedRT.Release();
@@ -1027,9 +1416,7 @@ public class ARMEUserStudyController : MonoBehaviour
             if (vp.clip == null)
                 continue;
 
-            string baseName = vp.clip.name;
-            if (baseName.EndsWith("_TB"))
-                baseName = baseName.Substring(0, baseName.Length - 3);
+            string baseName = ARMEEditorAssetUtil.StripTopBottomSuffix(vp.clip.name);
 
             if (!seen.Add(baseName))
                 continue; // skip a duplicate VideoPlayer pointing at the same piece
@@ -1062,14 +1449,6 @@ public class ARMEUserStudyController : MonoBehaviour
     }
 
     private static T FindAsset<T>(string assetName, string folder) where T : UnityEngine.Object
-    {
-        foreach (string guid in UnityEditor.AssetDatabase.FindAssets($"t:{typeof(T).Name}", new[] { folder }))
-        {
-            string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
-            if (System.IO.Path.GetFileNameWithoutExtension(path) == assetName)
-                return UnityEditor.AssetDatabase.LoadAssetAtPath<T>(path);
-        }
-        return null;
-    }
+        => ARMEEditorAssetUtil.FindAsset<T>(assetName, folder);
 #endif
 }

@@ -500,11 +500,12 @@ namespace ARMEPlayback
             if (config.controller == null || config.DesiredOnsetTimes.Count == 0)
                 return;
 
-            // Use padded onset times if padding is applied, otherwise use original
-            List<float> onsetTimes = config.controller.HasPadding ? 
-                config.controller.GetPaddedOnsetTimes() : 
-                config.controller.GetOriginalOnsetTimes();
-                
+            // Use padded onset times if padding is applied, otherwise use original.
+            // Read-only views avoid a per-FixedUpdate List copy (behaviour unchanged).
+            IReadOnlyList<float> onsetTimes = config.controller.HasPadding ?
+                config.controller.PaddedOnsetTimes :
+                config.controller.OriginalOnsetTimes;
+
             if (onsetTimes.Count == 0)
                 return;
 
@@ -540,11 +541,12 @@ namespace ARMEPlayback
             config.controller.ApplyOnsetTimeRatio(originalTime, desiredTime);
             config.LastAppliedRatio = config.controller.GetCurrentTimeRatio();
 
-            // Warp the video at the same ratio the audio just took, so the picture
-            // tracks the sound through this onset segment.
+            // The native ratio is a duration/stretch factor; VideoPlayer expects
+            // playback speed, so use the inverse to keep picture and sound aligned.
             if (driveVideo && config.videoPlayer != null && config.videoPlayer.canSetPlaybackSpeed)
             {
-                config.videoPlayer.playbackSpeed = Mathf.Clamp(config.LastAppliedRatio, 0.25f, 3f);
+                float videoSpeed = 1f / Mathf.Max(0.01f, config.LastAppliedRatio);
+                config.videoPlayer.playbackSpeed = Mathf.Clamp(videoSpeed, 0.25f, 3f);
             }
 
             _totalOnsetsProcessed++;
@@ -870,9 +872,9 @@ namespace ARMEPlayback
         /// </summary>
         private float ExpectedSourceTime(DesiredOnsetConfig config, float gt)
         {
-            List<float> original = config.controller.HasPadding
-                ? config.controller.GetPaddedOnsetTimes()
-                : config.controller.GetOriginalOnsetTimes();
+            IReadOnlyList<float> original = config.controller.HasPadding
+                ? config.controller.PaddedOnsetTimes
+                : config.controller.OriginalOnsetTimes;
             List<float> desired = config.DesiredOnsetTimes;
 
             int n = Mathf.Min(original.Count, desired.Count);
@@ -1106,21 +1108,10 @@ namespace ARMEPlayback
         }
 
         private static string StripTopBottomSuffix(string clipName)
-        {
-            return clipName.EndsWith("_TB") ? clipName.Substring(0, clipName.Length - 3) : clipName;
-        }
+            => ARMEEditorAssetUtil.StripTopBottomSuffix(clipName);
 
         private static T FindAssetByName<T>(string assetName, string folder) where T : UnityEngine.Object
-        {
-            string[] guids = UnityEditor.AssetDatabase.FindAssets($"t:{typeof(T).Name}", new[] { folder });
-            foreach (string guid in guids)
-            {
-                string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
-                if (System.IO.Path.GetFileNameWithoutExtension(path) == assetName)
-                    return UnityEditor.AssetDatabase.LoadAssetAtPath<T>(path);
-            }
-            return null;
-        }
+            => ARMEEditorAssetUtil.FindAsset<T>(assetName, folder);
 
         #endregion
 #endif

@@ -100,6 +100,8 @@ namespace ARMEPlayback
 
         // Private members
         private SimplePlaybackController _playbackController;
+        private SimplePlaybackController _pendingDispose;   // controller retired by RestartFromBeginning, freed a few frames later
+        private int _pendingDisposeFrame;
         private float[] _audioBuffer;
         private float[] _outputBuffer;
         private bool _isInitialized = false;
@@ -164,8 +166,26 @@ namespace ARMEPlayback
         /// <summary>
         /// Clean up when destroyed
         /// </summary>
+        /// <summary>
+        /// Free a controller retired by RestartFromBeginning, a few frames after the swap, so an
+        /// in-flight OnAudioFilterRead can never touch freed native memory.
+        /// </summary>
+        void Update()
+        {
+            if (_pendingDispose != null && Time.frameCount >= _pendingDisposeFrame)
+            {
+                _pendingDispose.Dispose();
+                _pendingDispose = null;
+            }
+        }
+
         void OnDestroy()
         {
+            if (_pendingDispose != null)
+            {
+                _pendingDispose.Dispose();
+                _pendingDispose = null;
+            }
             if (_playbackController != null)
             {
                 _playbackController.Dispose();
@@ -406,7 +426,11 @@ namespace ARMEPlayback
         /// </summary>
         void OnAudioFilterRead(float[] data, int channels)
         {
-            if (!_isInitialized || _playbackController == null || !isPlaying)
+            // Read the controller reference once — a take restart may swap it on the main thread.
+            // The retired instance is kept alive for a few frames (see RestartFromBeginning), so
+            // this call can safely finish on whichever one it grabbed.
+            var controller = _playbackController;
+            if (!_isInitialized || controller == null || !isPlaying)
             {
                 // Fill with silence if not ready or not playing
                 for (int i = 0; i < data.Length; i++)
@@ -417,9 +441,9 @@ namespace ARMEPlayback
             try
             {
                 int samplesNeeded = data.Length / channels;
-                
+
                 // Get stretched samples from controller
-                int samplesGot = _playbackController.GetSamples(_outputBuffer);
+                int samplesGot = controller.GetSamples(_outputBuffer);
                 
                
                 // Copy to output buffer (duplicate mono to stereo if needed)
@@ -523,6 +547,15 @@ namespace ARMEPlayback
         }
 
         /// <summary>
+        /// Read-only views of the parsed onset times that DON'T allocate a defensive copy.
+        /// Intended for per-frame readers (e.g. the ensemble scheduler) where the copying
+        /// Get*OnsetTimes() methods above would churn the GC. Callers must treat them as
+        /// read-only and must not cache them across a reparse.
+        /// </summary>
+        public IReadOnlyList<float> OriginalOnsetTimes => originalOnsetTimes;
+        public IReadOnlyList<float> PaddedOnsetTimes => paddedOnsetTimes;
+
+        /// <summary>
         /// Apply time ratio adjustment based on onset timing
         /// Called by ensemble controller when onset timing needs adjustment
         /// </summary>
@@ -553,9 +586,9 @@ namespace ARMEPlayback
         }
 
         /// <summary>
-        /// Set a constant playback speed (time-stretch ratio) directly: 1.0 = normal,
-        /// 2.0 = double tempo, 0.5 = half tempo. Used for simple tempo-following where the
-        /// whole recording is scaled to a tempo rather than warped onset-by-onset.
+        /// Set a constant Unity-style playback speed: 1.0 = normal, 2.0 = double tempo,
+        /// 0.5 = half tempo. The native stretcher's TimeRatio is a duration/stretch
+        /// ratio, so it is the inverse of playback speed.
         /// </summary>
         public void SetSpeed(float speed)
         {
@@ -564,7 +597,8 @@ namespace ARMEPlayback
 
             try
             {
-                _playbackController.TimeRatio = Mathf.Max(0.01f, speed);
+                float playbackSpeed = Mathf.Max(0.01f, speed);
+                _playbackController.TimeRatio = 1f / playbackSpeed;
                 currentTimeRatio = _playbackController.TimeRatio;
             }
             catch (System.Exception ex)
@@ -690,6 +724,53 @@ namespace ARMEPlayback
                 {
                     Debug.LogWarning($"[{gameObject.name}] Failed to reset playback: {ex.Message}");
                 }
+            }
+        }
+
+        /// <summary>
+        /// Rewind to the very start and play again. The native C API can't reset the read
+        /// position (resetPlayback() isn't exported), so we rebuild the stretcher — a fresh
+        /// controller starts at sample 0. Stop()+SetAudioBuffer()+Start() alone leave the read
+        /// position at the end of the buffer, so a replayed take would be silent.
+        /// </summary>
+        public void RestartFromBeginning()
+        {
+            if (!_isInitialized || _audioBuffer == null)
+                return;
+
+            try
+            {
+                if (isRecording)
+                    StopRecordingAndSave();
+
+                var fresh = new SimplePlaybackController(AudioSettings.outputSampleRate, blockSize);
+                fresh.SetAudioBuffer(_audioBuffer, _originalSampleRate);
+                fresh.TimeRatio = 1.0f;
+                fresh.Start();
+
+                // Swap in the started controller (atomic reference write); the audio thread picks
+                // it up on its next block.
+                var old = _playbackController;
+                _playbackController = fresh;
+                currentTimeRatio = 1.0f;
+                currentOnsetIndex = 0;
+                isPlaying = true;
+
+                if (enableRecording)
+                    StartRecording();
+
+                // Retire the previous controller for deferred disposal. Free any still-pending one
+                // first (it is seconds old by now — safe).
+                _pendingDispose?.Dispose();
+                _pendingDispose = old;
+                _pendingDisposeFrame = Time.frameCount + 4;
+
+                if (enableDebugLogging)
+                    Debug.Log($"🔁 [{gameObject.name}] Restarted playback from the beginning");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[{gameObject.name}] RestartFromBeginning failed: {ex.Message}");
             }
         }
 

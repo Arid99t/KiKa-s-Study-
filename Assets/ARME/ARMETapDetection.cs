@@ -61,6 +61,11 @@ public class ARMETapDetection : MonoBehaviour
     [SerializeField] private float referenceBPM = 120f;
 
     [BoxGroup("Tempo")]
+    [Tooltip("Ignore taps that arrive closer together than this (seconds). Filters contact bounce / streamed sensor lines so one physical press counts once.")]
+    [Range(0f, 0.5f)]
+    [SerializeField] private float minTapInterval = 0.12f;
+
+    [BoxGroup("Tempo")]
     [Tooltip("How many recent taps to average for tempo calculation")]
     [Range(2, 16)]
     [SerializeField] private int tempoWindowSize = 4;
@@ -97,13 +102,18 @@ public class ARMETapDetection : MonoBehaviour
     /// <summary>Current estimated BPM from tap tempo.</summary>
     public float CurrentBPM => currentBPM;
 
-    private SerialPort _serialPort;
+    private SerialPort _serialPort;             // Windows serial path
+    private System.IO.Stream _readStream;       // Windows: SerialPort.BaseStream consumed by the read thread
+    private int _fd = -1;                        // macOS/Linux: raw non-blocking file descriptor
+    private readonly object _connectLock = new object();
     private float _lastTapTimestamp;
+    private float _lastAcceptedTapTime = -999f;
     private const int MaxLogLines = 12;
     private float _tapFlashTimer;
 
     private Thread _readThread;
     private volatile bool _keepReading;
+    private volatile bool _loggedFirstData;
     private readonly ConcurrentQueue<string> _lineQueue = new ConcurrentQueue<string>();
 
     // ── Data Logging Event ───────────────────────────────────────────────
@@ -112,22 +122,81 @@ public class ARMETapDetection : MonoBehaviour
     private readonly System.Collections.Generic.List<float> _tapTimestamps = new System.Collections.Generic.List<float>();
     private float _targetSpeed = 1f;
 
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+    // Native POSIX I/O so the device can be opened NON-BLOCKING and polled. A blocking managed read
+    // holds a SafeHandle ref that makes Disconnect's stream-close wait forever (the hang). With a raw
+    // fd + O_NONBLOCK the read thread never parks, so Disconnect tears down instantly.
+    private const int O_RDONLY = 0x0000;
+#if UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+    private const int O_NONBLOCK = 0x800;     // Linux
+#else
+    private const int O_NONBLOCK = 0x0004;    // macOS / Darwin
+#endif
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Ansi)]
+    private static extern int open(string path, int oflag);
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+    private static extern int close(int fd);
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+    private static extern System.IntPtr read(int fd, byte[] buf, System.IntPtr count);
+#endif
+
     private DropdownList<string> GetAvailablePorts()
     {
         var list = new DropdownList<string>();
-        string[] ports = SerialPort.GetPortNames();
+        var seen = new System.Collections.Generic.HashSet<string>();
 
-        if (ports.Length == 0)
+        void Offer(string p)
         {
+            if (!string.IsNullOrEmpty(p) && seen.Add(p))
+                list.Add(p, p);
+        }
+
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+        // Mono's SerialPort.GetPortNames() is unreliable on macOS — it typically returns only the
+        // Bluetooth port and misses USB devices. Enumerate /dev directly and prefer the cu.* ports.
+        try
+        {
+            // GetFileSystemEntries (unlike GetFiles) returns device nodes, which Mono otherwise
+            // filters out — that's why the dropdown came up empty.
+            foreach (string dev in System.IO.Directory.GetFileSystemEntries("/dev", "cu.*"))
+                Offer(dev);
+            foreach (string dev in System.IO.Directory.GetFileSystemEntries("/dev", "tty.usb*"))
+                Offer(dev);
+        }
+        catch { /* /dev not enumerable on this platform — fall back to GetPortNames below. */ }
+#endif
+
+        foreach (string port in SerialPort.GetPortNames())
+        {
+            // On macOS, GetPortNames() returns the /dev/tty.* devices, but those block on open
+            // under Mono — the call-unit (/dev/cu.*) device is the one that actually reads. Offer
+            // the cu.* variant first so it's the natural pick.
+            if (port.StartsWith("/dev/tty."))
+                Offer("/dev/cu." + port.Substring("/dev/tty.".Length));
+            Offer(port);
+        }
+
+        if (seen.Count == 0)
             list.Add("No ports found", "");
-        }
-        else
-        {
-            foreach (string port in ports)
-                list.Add(port, port);
-        }
 
         return list;
+    }
+
+    /// <summary>
+    /// On macOS the /dev/tty.* serial device blocks on open under Mono; the equivalent /dev/cu.*
+    /// device is the one that delivers data. Translate a chosen tty.* port to cu.* so a port picked
+    /// from the dropdown still works.
+    /// </summary>
+    private static string ResolvePortName(string port)
+    {
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+        if (!string.IsNullOrEmpty(port) && port.StartsWith("/dev/tty."))
+            return "/dev/cu." + port.Substring("/dev/tty.".Length);
+#endif
+        return port;
     }
 
     void Start()
@@ -138,7 +207,7 @@ public class ARMETapDetection : MonoBehaviour
 
     void Update()
     {
-        if (!isConnected || _serialPort == null || !_serialPort.IsOpen)
+        if (!isConnected)
             return;
 
         timeSinceLastTap = Time.time - _lastTapTimestamp;
@@ -159,38 +228,70 @@ public class ARMETapDetection : MonoBehaviour
 
     private void ReadSerialThread()
     {
+        var bytes = new byte[1024];
         string buffer = "";
+
         while (_keepReading)
         {
+            int n;
             try
             {
-                if (_serialPort == null || !_serialPort.IsOpen)
-                    break;
-
-                string data = _serialPort.ReadExisting();
-                if (string.IsNullOrEmpty(data))
-                {
-                    Thread.Sleep(5);
-                    continue;
-                }
-
-                buffer += data;
-
-                int newlineIndex;
-                while ((newlineIndex = buffer.IndexOf('\n')) >= 0)
-                {
-                    string line = buffer.Substring(0, newlineIndex).Trim();
-                    buffer = buffer.Substring(newlineIndex + 1);
-
-                    if (line.Length > 0)
-                        _lineQueue.Enqueue(line);
-                }
+                n = ReadChunk(bytes);
             }
-            catch (System.Exception)
+            catch (System.Exception ex)
             {
+                // Source closed/disposed (Disconnect) — exit. Log only if it wasn't a deliberate stop.
+                if (_keepReading)
+                    Debug.LogWarning($"[TapDetection] read loop stopped: {ex.Message}");
                 break;
             }
+
+            if (n <= 0)
+            {
+                // No data available right now (non-blocking read / timeout). Brief sleep, then
+                // re-check _keepReading so Disconnect can stop us promptly without blocking.
+                Thread.Sleep(3);
+                continue;
+            }
+
+            if (!_loggedFirstData)
+            {
+                _loggedFirstData = true;
+                Debug.Log("[TapDetection] Receiving serial data from the sensor.");
+            }
+
+            buffer += System.Text.Encoding.ASCII.GetString(bytes, 0, n);
+
+            int newlineIndex;
+            while ((newlineIndex = buffer.IndexOf('\n')) >= 0)
+            {
+                string line = buffer.Substring(0, newlineIndex).Trim();
+                buffer = buffer.Substring(newlineIndex + 1);
+
+                if (line.Length > 0)
+                    _lineQueue.Enqueue(line);
+            }
         }
+    }
+
+    /// <summary>
+    /// Reads a chunk of bytes from the active source. Returns the number of bytes read, or &lt;= 0 when
+    /// nothing is available right now (so the caller sleeps briefly and re-checks the stop flag).
+    /// macOS/Linux use a non-blocking raw fd; Windows uses the SerialPort stream with a read timeout.
+    /// </summary>
+    private int ReadChunk(byte[] buf)
+    {
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+        int fd = _fd;
+        if (fd < 0) return -1;
+        // Non-blocking: returns -1 with EAGAIN when there's no data, which we treat as "nothing yet".
+        return read(fd, buf, (System.IntPtr)buf.Length).ToInt32();
+#else
+        var stream = _readStream;
+        if (stream == null) return -1;
+        try { return stream.Read(buf, 0, buf.Length); }
+        catch (System.TimeoutException) { return 0; }   // SerialPort read timeout — nothing this round.
+#endif
     }
 
     private void ParseTapLine(string line)
@@ -217,6 +318,12 @@ public class ARMETapDetection : MonoBehaviour
             lastForce = force;
             forceBar = force;
         }
+
+        // Debounce: drop bounce / streamed lines that arrive too soon after the last accepted tap,
+        // so one physical press registers once. (Force bar above still updates for live feedback.)
+        if (Time.time - _lastAcceptedTapTime < minTapInterval)
+            return;
+        _lastAcceptedTapTime = Time.time;
 
         _lastTapTimestamp = Time.time;
         timeSinceLastTap = 0f;
@@ -254,6 +361,39 @@ public class ARMETapDetection : MonoBehaviour
         tapLog = string.IsNullOrEmpty(tapLog) ? entry : tapLog + "\n" + entry;
     }
 
+    [Button("Auto-Detect Teensy")]
+    private void AutoDetectTeensy()
+    {
+        string found = null;
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+        try
+        {
+            var candidates = new System.Collections.Generic.List<string>();
+            candidates.AddRange(System.IO.Directory.GetFileSystemEntries("/dev", "cu.usbmodem*"));
+            candidates.AddRange(System.IO.Directory.GetFileSystemEntries("/dev", "cu.usbserial*"));
+            candidates.AddRange(System.IO.Directory.GetFileSystemEntries("/dev", "tty.usbmodem*"));
+            if (candidates.Count > 0) found = candidates[0];
+        }
+        catch (System.Exception ex) { Debug.LogWarning($"Auto-detect failed: {ex.Message}"); }
+#else
+        foreach (string p in SerialPort.GetPortNames())
+            if (p.IndexOf("usb", System.StringComparison.OrdinalIgnoreCase) >= 0) { found = p; break; }
+#endif
+
+        if (!string.IsNullOrEmpty(found))
+        {
+            portName = ResolvePortName(found);
+            Debug.Log($"Teensy port set to {portName}.");
+#if UNITY_EDITOR
+            UnityEditor.EditorUtility.SetDirty(this);
+#endif
+        }
+        else
+        {
+            Debug.LogWarning("No Teensy (usbmodem/usbserial) port found. Is it plugged in and set to USB Type 'Serial'?");
+        }
+    }
+
     [Button("List Available Ports")]
     private void ListAvailablePorts()
     {
@@ -272,55 +412,107 @@ public class ARMETapDetection : MonoBehaviour
     [Button("Connect")]
     private void Connect()
     {
-        if (isConnected)
+        lock (_connectLock)
         {
-            Debug.LogWarning("Already connected.");
-            return;
-        }
-
-        try
-        {
-            _serialPort = new SerialPort(portName, baudRate)
+            if (isConnected)
             {
-                DtrEnable = true,
-                ReadTimeout = 100
-            };
-            _serialPort.Open();
-            isConnected = true;
+                Debug.LogWarning("Already connected.");
+                return;
+            }
 
-            _keepReading = true;
-            _readThread = new Thread(ReadSerialThread)
+            string resolvedPort = ResolvePortName(portName);
+            if (string.IsNullOrEmpty(resolvedPort))
             {
-                IsBackground = true
-            };
-            _readThread.Start();
+                Debug.LogError("No port selected. Click 'Auto-Detect Teensy' or pick a port first.");
+                return;
+            }
 
-            Debug.Log($"Connected to {portName} at {baudRate} baud.");
-        }
-        catch (System.Exception ex)
-        {
-            Debug.LogError($"Failed to open {portName}: {ex.Message}");
-            isConnected = false;
+            try
+            {
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+                // macOS/Linux: Mono's SerialPort is unreliable here (opens but never delivers bytes),
+                // so open the device node directly and NON-BLOCKING — exactly what `cat` does, but
+                // pollable so Disconnect can stop the read thread instantly without deadlocking.
+                // USB-CDC ignores the baud rate, so no termios configuration is needed for the Teensy.
+                int fd = open(resolvedPort, O_RDONLY | O_NONBLOCK);
+                if (fd < 0)
+                    throw new System.Exception($"open() failed (errno {System.Runtime.InteropServices.Marshal.GetLastWin32Error()})");
+                _fd = fd;
+#else
+                // Windows: SerialPort works well. ReadTimeout keeps the read loop responsive to stop.
+                _serialPort = new SerialPort(resolvedPort, baudRate)
+                {
+                    DtrEnable = true,
+                    ReadTimeout = 100
+                };
+                _serialPort.Open();
+                _readStream = _serialPort.BaseStream;
+#endif
+                _keepReading = true;
+                _loggedFirstData = false;
+                _readThread = new Thread(ReadSerialThread)
+                {
+                    IsBackground = true
+                };
+                _readThread.Start();
+
+                isConnected = true;
+                Debug.Log($"Connected to {resolvedPort}.");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"Failed to open {resolvedPort}: {ex.Message}");
+                Cleanup();
+            }
         }
     }
 
     [Button("Disconnect")]
     private void Disconnect()
     {
-        _keepReading = false;
-        if (_readThread != null && _readThread.IsAlive)
-            _readThread.Join(500);
-        _readThread = null;
-
-        if (_serialPort != null && _serialPort.IsOpen)
+        lock (_connectLock)
         {
-            _serialPort.Close();
-            _serialPort.Dispose();
+            if (!isConnected && _readThread == null && _fd < 0 && _serialPort == null)
+                return;   // nothing to do
+
+            Cleanup();
+            Debug.Log("Disconnected from serial port.");
+        }
+    }
+
+    /// <summary>
+    /// Tears down the read thread and the device safely. The read thread uses non-blocking/timed
+    /// reads, so it observes _keepReading == false and exits within a few ms — we Join it BEFORE
+    /// closing the descriptor, so the main thread never blocks closing a handle that's in use.
+    /// </summary>
+    private void Cleanup()
+    {
+        _keepReading = false;
+
+        var thread = _readThread;
+        _readThread = null;
+        if (thread != null && thread.IsAlive && thread != Thread.CurrentThread)
+        {
+            if (!thread.Join(1000))
+                Debug.LogWarning("[TapDetection] read thread did not stop in time; abandoning it.");
+        }
+
+        // Worker has stopped using the source now — safe to close on this thread.
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+        if (_fd >= 0)
+        {
+            try { close(_fd); } catch { }
+            _fd = -1;
+        }
+#endif
+        _readStream = null;
+        if (_serialPort != null)
+        {
+            try { _serialPort.Dispose(); } catch { }
             _serialPort = null;
         }
 
         isConnected = false;
-        Debug.Log("Disconnected from serial port.");
     }
 
     [Button("Clear Log")]
