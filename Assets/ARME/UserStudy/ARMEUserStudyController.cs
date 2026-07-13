@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using System.Text;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.Video;
@@ -36,7 +35,7 @@ public readonly struct UserStudyTapEvent
     }
 }
 
-/// <summary>Payload fired each time a virtual player blinks.</summary>
+/// <summary>Payload fired each time a virtual player blinks (here: crosses a recorded onset).</summary>
 public readonly struct UserStudyBlinkEvent
 {
     public readonly float gameTime;
@@ -70,13 +69,12 @@ public readonly struct UserStudyModeEvent
 }
 
 /// <summary>
-/// Experimental condition for the ensemble.
-///   Adaptive    — Wing-Kristofferson coupling: virtuals follow the user.
-///   NonAdaptive — Fixed metronome at <c>fixedBPM</c>; user taps are ignored.
-///   Agentic     — Semi-independent agents: each has its own slightly drifting
-///                 tempo with per-blink jitter and only mild responsiveness to
-///                 the user, so they behave like interacting partners rather
-///                 than followers or a metronome.
+/// Experimental condition for the ensemble. These mirror the AMUSER app's three modes:
+///   Adaptive    — every virtual follows the user's tapped tempo (AMUSER "adaptive").
+///   NonAdaptive — virtuals ignore the user and play at the recording's own tempo
+///                 (AMUSER "non-agentic").
+///   Agentic     — virtuals follow mostly the user but partly each other, so they also
+///                 stay together (AMUSER "agentic": 0.7·user + 0.3·ensemble).
 /// </summary>
 public enum EnsembleMode
 {
@@ -86,11 +84,8 @@ public enum EnsembleMode
 }
 
 /// <summary>
-/// How tightly virtuals lock onto the user's beat in Adaptive mode.
-///   Custom        — Use inspector alpha/beta values verbatim (loose Wing-Kristofferson default).
-///   MusicalLoose  — Same as Custom but guarantees the phase-reset on activation (fixes drift-in bug).
-///   MusicalTight  — Stronger coupling (α≈0.6, β≈0.35); locks on within a few taps, still feels organic.
-///   SnapToBeat    — α=1, β=1; spheres snap exactly to the predicted next beat each tap. Looks perfectly synced.
+/// Legacy tightness preset (kept for scene/inspector compatibility; no longer drives the
+/// AMUSER-style per-onset warp, which follows the user's tempo directly).
 /// </summary>
 public enum SyncTightness
 {
@@ -101,9 +96,10 @@ public enum SyncTightness
 }
 
 /// <summary>
-/// One musician video driven by the timing model: a <see cref="VideoPlayer"/> (picture) and
-/// its audio (.wav) played on a plain <see cref="AudioSource"/>, both speed-matched to the
-/// user's tapped tempo. The recorded onset times are parsed for reference/alignment.
+/// One musician = one virtual player. A <see cref="VideoPlayer"/> (picture) plus its audio
+/// (.wav) played through a per-part native time-stretch controller. Each part runs on its OWN
+/// clock (its <see cref="VideoPlayer.time"/>) and warps its own recording onset-by-onset so the
+/// recorded onsets land on the user's beat — exactly like AMUSER's per-player AVPlayer/AVAudioPlayer.
 /// </summary>
 [System.Serializable]
 public class VideoPart
@@ -114,7 +110,7 @@ public class VideoPart
     [Tooltip("VideoPlayer that shows this part's clip. Its playbackSpeed is warped to the model's onsets.")]
     public VideoPlayer video;
 
-    [Tooltip("This part's audio (.wav). Routed through the time-stretch playback controller (silent until the native DLL deps are installed).")]
+    [Tooltip("This part's audio (.wav). Routed through the native pitch-preserving time-stretch controller.")]
     public AudioClip audioClip;
 
     [Tooltip("Onset file (-CRNNManual): one timestamp per line, used to warp the recording onto the user's beat.")]
@@ -124,9 +120,15 @@ public class VideoPart
     public Renderer displayRenderer;
 
     // ── Runtime state (not serialized) ───────────────────────────────────
-    [System.NonSerialized] public AudioSource audioSource;   // plays the .wav directly (DLL-free); pitch tracks tempo
+    [System.NonSerialized] public AudioSource audioSource;   // native: DSP keep-alive source; fallback: plays the real clip
+    [System.NonSerialized] public ARMEOnsetBasedPlaybackController controller; // pitch-preserving native time-stretch (null in fallback)
+    [System.NonSerialized] public bool useNativeAudio;       // true = native stretch; false = AudioSource.pitch fallback
     [System.NonSerialized] public List<float> onsets;
-    [System.NonSerialized] public float speed;            // last playbackSpeed written to the video
+    [System.NonSerialized] public float speed;               // last playbackSpeed written to the video
+    [System.NonSerialized] public int onsetIndex;            // current source-onset boundary reached (AMUSER currentOnset)
+    [System.NonSerialized] public float currentRate;         // last applied rate (tempo ratio); seeds the ensemble mean
+    [System.NonSerialized] public float effectiveInterval;   // this part's current target interval (s)
+    [System.NonSerialized] public bool finished;             // reached the final onset
     [System.NonSerialized] public RenderTexture ownedRT;
     [System.NonSerialized] public Material matInstance;
 }
@@ -134,6 +136,12 @@ public class VideoPart
 /// <summary>
 /// User study controller for the ARME Timing Model. See <see cref="EnsembleMode"/>
 /// for the three experimental conditions.
+///
+/// Behaviour mirrors the AMUSER iOS app: each musician is an independent virtual player that
+/// runs on its own clock and warps its own recording segment-by-segment (pitch-preserving)
+/// so its recorded onsets land on the user's tapped beat. The per-onset rate is produced by
+/// the ARME Timing Model via <see cref="ARMEPlaybackTimingBridge"/>; Agentic mode adds the
+/// AMUSER ensemble coupling (0.7·user + 0.3·ensemble-mean) so the parts also stay together.
 /// </summary>
 public class ARMEUserStudyController : MonoBehaviour
 {
@@ -142,7 +150,7 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private EnsembleMode mode = EnsembleMode.Adaptive;
 
     [BoxGroup("Virtual Players")]
-    [Tooltip("How many virtual players the timing model runs. Each is mapped (cycling) to one of the scene's video parts. For independent per-musician warp, set this equal to the number of video parts (≤4).")]
+    [Tooltip("Reported in the session log. The actual virtual players are the video parts below (one musician = one player).")]
     [SerializeField, Range(1, 15)] private int numVirtualPlayers = 3;
 
     [BoxGroup("Videos")]
@@ -158,39 +166,35 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private string videoTextureProperty = "_TB";
 
     [BoxGroup("Videos")]
-    [Tooltip("Tempo (BPM) at which the recordings play at their normal 1x speed. Tap at this rate and the video plays natively; tapping faster/slower scales the playback speed proportionally.")]
+    [Tooltip("Tempo (BPM) at which the recordings play at their normal 1x speed. Tap at this rate and the videos play natively; tapping faster/slower scales each part's playback speed proportionally.")]
     [SerializeField, Range(40f, 220f)] private float naturalBPM = 120f;
 
     [BoxGroup("Videos")]
-    [Tooltip("Lower clamp on the video playback speed while following the user (fraction of native speed). No matter how slowly you tap, the video won't go below this.")]
+    [Tooltip("Lower clamp on a part's playback speed while following the user (fraction of native speed). No matter how slowly you tap, a part won't go below this.")]
     [SerializeField, Range(0.1f, 1f)] private float minPlaybackSpeed = 0.5f;
 
     [BoxGroup("Videos")]
-    [Tooltip("Upper clamp on the video playback speed while following the user (multiple of native speed). No matter how fast you tap, the video won't go above this.")]
-    [SerializeField, Range(1f, 4f)] private float maxPlaybackSpeed = 1.2f;
-
-    [BoxGroup("Videos")]
-    [Tooltip("How quickly the videos ease to a new tempo when your tapping speed changes (higher = snappier, lower = smoother). Ramping avoids jolting the decoder and audio on every tap.")]
-    [SerializeField, Range(1f, 20f)] private float speedSmoothRate = 6f;
+    [Tooltip("Upper clamp on a part's playback speed while following the user (multiple of native speed). No matter how fast you tap, a part won't go above this.")]
+    [SerializeField, Range(1f, 4f)] private float maxPlaybackSpeed = 2.0f;
 
     [BoxGroup("Random Mode")]
-    [Tooltip("Minimum random blink interval (seconds) when in Random mode (no recent user input).")]
+    [Tooltip("(Legacy — unused by the AMUSER-style warp.) Minimum random blink interval.")]
     [SerializeField] private float minRandomInterval = 0.4f;
 
     [BoxGroup("Random Mode")]
-    [Tooltip("Maximum random blink interval (seconds) when in Random mode.")]
+    [Tooltip("(Legacy — unused by the AMUSER-style warp.) Maximum random blink interval.")]
     [SerializeField] private float maxRandomInterval = 1.2f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Preset that overrides alpha/beta to control how tightly virtuals lock onto your beat. Set to Custom to use the alpha/beta sliders below.")]
+    [Tooltip("(Legacy preset — unused by the AMUSER-style warp, which follows the user's tempo directly.)")]
     [SerializeField] private SyncTightness syncTightness = SyncTightness.MusicalTight;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Phase-correction gain. Each user tap pulls each virtual's next-blink time toward the model's predicted onset by this fraction of the error. 0 = no phase coupling, 1 = snap to prediction immediately. Ignored unless syncTightness = Custom.")]
+    [Tooltip("Logged for the session record. (Coupling now follows AMUSER: Agentic = 0.7·user + 0.3·ensemble.)")]
     [SerializeField, Range(0f, 1f)] private float alpha = 0.30f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Period-correction gain. Each user tap blends each virtual's internal IOI toward the user's measured IOI by this fraction. 0 = no tempo adaptation, 1 = match user immediately. Ignored unless syncTightness = Custom.")]
+    [Tooltip("Logged for the session record. (Coupling now follows AMUSER: Agentic = 0.7·user + 0.3·ensemble.)")]
     [SerializeField, Range(0f, 1f)] private float beta = 0.15f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
@@ -198,11 +202,11 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField, Range(0f, 1f)] private float userIoiSmoothing = 0.30f;
 
     [BoxGroup("Adaptation (Wing-Kristofferson)")]
-    [Tooltip("Per-virtual visual phase offset (seconds). Virtual i targets predicted+offset*i so blinks pulse around the user's beat instead of on top of it. Set to 0 for in-phase sync.")]
+    [Tooltip("(Legacy — unused by the AMUSER-style warp.) Per-virtual visual phase offset.")]
     [SerializeField, Range(0f, 0.5f)] private float phaseOffsetPerPlayer = 0.0f;
 
     [BoxGroup("Idle Behaviour")]
-    [Tooltip("If the user stops tapping for more than this many user-IOIs, virtuals revert to Random mode. (Adaptive mode only.)")]
+    [Tooltip("If the user stops tapping for more than this many user-IOIs, the parts ease back to the recorded tempo. (Adaptive / Agentic only.)")]
     [SerializeField, Range(1f, 10f)] private float idleTimeoutFactor = 2.5f;
 
     [BoxGroup("Idle Behaviour")]
@@ -210,28 +214,24 @@ public class ARMEUserStudyController : MonoBehaviour
     [SerializeField] private float fallbackIdleSeconds = 3.0f;
 
     [BoxGroup("Non-Adaptive Mode")]
-    [Tooltip("Fixed ensemble tempo for Non-Adaptive and Agentic modes (BPM).")]
+    [Tooltip("Logged for the session record. (Non-Adaptive now plays at the recording's own tempo, matching AMUSER's non-agentic mode.)")]
     [SerializeField, Range(40f, 200f)] private float fixedBPM = 90f;
 
     [BoxGroup("Agentic Mode")]
-    [Tooltip("Per-virtual baseline IOI variation (seconds). Each virtual draws a fixed offset at start so the ensemble isn't homogeneous.")]
+    [Tooltip("Logged for the session record.")]
     [SerializeField, Range(0f, 0.3f)] private float agenticIoiVariation = 0.06f;
 
     [BoxGroup("Agentic Mode")]
-    [Tooltip("Standard deviation of Gaussian noise added to each virtual's blink interval (seconds). Drives per-blink timing jitter.")]
+    [Tooltip("Logged for the session record.")]
     [SerializeField, Range(0f, 0.2f)] private float agenticTimingNoise = 0.04f;
 
     [BoxGroup("Agentic Mode")]
-    [Tooltip("How strongly each virtual's IOI drifts back to its own baseline (vs. wandering freely). 0 = pure drift, 1 = locked to baseline.")]
+    [Tooltip("Logged for the session record.")]
     [SerializeField, Range(0f, 1f)] private float agenticBaselinePull = 0.25f;
 
     [BoxGroup("Agentic Mode")]
-    [Tooltip("Reduced phase-correction gain in Agentic mode — agents only loosely follow the user.")]
-    [SerializeField, Range(0f, 1f)] private float agenticAlpha = 0.10f;
-
-    [BoxGroup("Agentic Mode")]
-    [Tooltip("Reduced period-correction gain in Agentic mode.")]
-    [SerializeField, Range(0f, 1f)] private float agenticBeta = 0.05f;
+    [Tooltip("How strongly each virtual follows the user vs. the ensemble mean in Agentic mode (AMUSER agenticUserWeight). 1 = pure user, 0 = pure ensemble.")]
+    [SerializeField, Range(0f, 1f)] private float agenticUserWeight = 0.7f;
 
     [BoxGroup("Logging")]
     [SerializeField] private bool verboseLogging = true;
@@ -254,30 +254,16 @@ public class ARMEUserStudyController : MonoBehaviour
     [BoxGroup("Status")]
     [ReadOnly, AllowNesting] public EnsembleMode currentMode;
 
-    private const int UserPlayerIndex = 0;
+    // ── Runtime ──────────────────────────────────────────────────────────
+    private ARMEPlaybackTimingBridge _timingBridge;   // AMUSER-style per-onset rate via the Timing Model
+    private float _ensembleMeanRate = 1f;             // mean of parts' currentRate (Agentic coupling)
+    private AudioClip _dspKeepAlive;                  // tiny looping silent clip so each part's OnAudioFilterRead fires
 
-    private SimpleTimingModel _model;
-    private float[] _virtualIOI;          // each virtual's current internal IOI
-    private float[] _virtualBaselineIOI;  // Agentic: per-virtual baseline tempo
-    private float[] _nextBlinkTime;       // when each virtual fires next
-    private int[] _onsetCounts;
-
-    // Video startup is deferred until every VideoPlayer has finished preparing so the
-    // pictures begin together with the audio.
+    // Video/audio startup is deferred until every part has finished preparing so the pictures
+    // and the native stretchers begin together.
     private bool _videosPending;
     private float _videoArmTime;
-    private float _ensembleSpeed = 1f;   // shared, smoothly-ramped playback speed for every part
     private float _previousUserTapTime = -1f;
-    private bool _haveSpawnGaussian;
-    private float _spareGaussian;
-
-    // ARME expects ensemble onsets to share a beat index across players. We increment a
-    // shared beat counter on each user tap and register the user + each virtual whose
-    // most recent blink is "pending" under that same index. Without this the per-player
-    // onset counts diverge as virtuals freewheel and ARME's predictions degenerate to
-    // -900 sentinels or past-time values.
-    private int _currentBeatIndex;
-    private float[] _pendingBlinkTime;    // virtual's most recent blink time awaiting a beat slot (-1 = none)
 
     // ── Data Logging Events ──────────────────────────────────────────────
     public event System.Action<UserStudyTapEvent>   OnUserTap;
@@ -287,7 +273,7 @@ public class ARMEUserStudyController : MonoBehaviour
     /// <summary>Returns a configuration snapshot for CSV session metadata.</summary>
     public SessionConfig GetSessionConfig() => new SessionConfig
     {
-        numVirtualPlayers   = numVirtualPlayers,
+        numVirtualPlayers   = videoParts != null ? videoParts.Count : numVirtualPlayers,
         startMode           = mode,
         alpha               = alpha,
         beta                = beta,
@@ -298,75 +284,37 @@ public class ARMEUserStudyController : MonoBehaviour
         agenticBaselinePull = agenticBaselinePull,
     };
 
-    private int TotalPlayers => numVirtualPlayers + 1;
-
     void Start()
     {
-        _model = new SimpleTimingModel(TotalPlayers);
-        _model.CreateNewParameters();
-
-        _virtualIOI = new float[TotalPlayers];
-        _virtualBaselineIOI = new float[TotalPlayers];
-        _nextBlinkTime = new float[TotalPlayers];
-        _onsetCounts = new int[TotalPlayers];
-        _pendingBlinkTime = new float[TotalPlayers];
-        for (int i = 0; i < TotalPlayers; i++) _pendingBlinkTime[i] = -1f;
-        _currentBeatIndex = 0;
+        _timingBridge = new ARMEPlaybackTimingBridge();
+        _dspKeepAlive = AudioClip.Create("ARME_DSPKeepAlive", 1024, 1, AudioSettings.outputSampleRate, false);
 
         BindVideoParts();
-        InitVirtualsForMode();
+        ApplyModeReset();
 
-        // Defer the actual video/audio start until every clip has finished preparing.
+        // Defer the actual start until every clip has prepared and every native controller
+        // has initialised, so audio and picture begin together.
         _videosPending = true;
         _videoArmTime = Time.time;
 
-        Log($"Ready. Players: {TotalPlayers} (P0=user, P1..P{numVirtualPlayers}=virtual). " +
-            $"Videos: {videoParts.Count}. Mode={mode}. alpha={alpha:F2}, beta={beta:F2}. Lib v{SimpleTimingModel.GetVersion()}");
+        Log($"Ready. Parts: {videoParts.Count}. Mode={mode}. naturalBPM={naturalBPM:F0}. " +
+            $"AMUSER-style per-player pitch-preserving warp.");
     }
 
-    /// <summary>
-    /// Set up each virtual's IOI and first blink time according to the active mode.
-    /// </summary>
-    private void InitVirtualsForMode()
+    /// <summary>Reset mode bookkeeping (no per-virtual blink arrays in the AMUSER-style model).</summary>
+    private void ApplyModeReset()
     {
         currentMode = mode;
         adaptiveMode = false;
-        float fixedIOI = 60f / Mathf.Max(1f, fixedBPM);
-
-        for (int i = 1; i < TotalPlayers; i++)
-        {
-            switch (mode)
-            {
-                case EnsembleMode.NonAdaptive:
-                    _virtualBaselineIOI[i] = fixedIOI;
-                    _virtualIOI[i] = fixedIOI;
-                    // Stagger first blinks so they don't fire perfectly in unison.
-                    _nextBlinkTime[i] = Time.time + (fixedIOI * (i / (float)TotalPlayers));
-                    break;
-
-                case EnsembleMode.Agentic:
-                    float jitter = Random.Range(-agenticIoiVariation, agenticIoiVariation);
-                    _virtualBaselineIOI[i] = Mathf.Max(0.1f, fixedIOI + jitter);
-                    _virtualIOI[i] = _virtualBaselineIOI[i];
-                    _nextBlinkTime[i] = Time.time + Random.Range(0.1f, _virtualIOI[i]);
-                    break;
-
-                case EnsembleMode.Adaptive:
-                default:
-                    _virtualBaselineIOI[i] = 0f;
-                    _virtualIOI[i] = Random.Range(minRandomInterval, maxRandomInterval);
-                    _nextBlinkTime[i] = Time.time + Random.Range(0.1f, _virtualIOI[i]);
-                    break;
-            }
-        }
     }
 
     private const string AudioFolder = "Assets/ARME/Ensemble/AudioClipsMain";
 
     /// <summary>
-    /// Bind the virtual players to the scene's musician videos (replaces sphere spawning).
-    /// Each part gets a plain <see cref="AudioSource"/> playing its .wav (DLL-free), its onset
-    /// file is parsed, and its display is bound so each plane shows its own clip.
+    /// Bind the virtual players to the scene's musician videos. Each part gets its own native
+    /// pitch-preserving playback controller (fed its .wav) plus a silent keep-alive AudioSource
+    /// so Unity keeps calling the controller's OnAudioFilterRead, its onset file is parsed, and
+    /// its display is bound so each plane shows its own clip.
     /// </summary>
     private void BindVideoParts()
     {
@@ -383,22 +331,29 @@ public class ARMEUserStudyController : MonoBehaviour
             if (part == null || part.video == null)
                 continue;
 
-            // Audio path: play the .wav directly through a plain AudioSource (no native DLL
-            // needed). Its pitch is matched to the video's playback speed so sound and picture
-            // stay locked to the tapped tempo. (The native time-stretch controller would hold
-            // pitch constant, but it needs rubberband/samplerate/sleef in Assets/Plugins/.)
             part.onsets = ParseOnsets(part.onsetFile);
+            part.currentRate = 1f;
+
             if (part.audioClip != null)
             {
                 var go = new GameObject($"Audio_{part.label}");
                 go.transform.SetParent(transform, false);
 
                 var src = go.AddComponent<AudioSource>();
-                src.clip = part.audioClip;
                 src.playOnAwake = false;
-                src.loop = false;          // play once
                 src.spatialBlend = 0f;     // 2D — no positional attenuation
+                src.volume = 1f;
                 part.audioSource = src;
+
+                // Attempt the native pitch-preserving controller. If its native library loads,
+                // it is used (AudioSource plays a silent keep-alive clip while the controller
+                // fills OnAudioFilterRead with time-stretched samples). If it does NOT load,
+                // StartVideos() removes it and falls back to driving AudioSource.pitch on the
+                // real clip (rate-based — pitch shifts with tempo, like AMUSER's AVAudioPlayer).
+                var ctrl = go.AddComponent<ARMEOnsetBasedPlaybackController>();
+                ctrl.EnableDebugLogging = verboseLogging;
+                ctrl.Configure(part.audioClip, part.onsetFile);
+                part.controller = ctrl;
             }
 
             // Configure the VideoPlayer. Plays once at native speed; we only modulate
@@ -542,20 +497,56 @@ public class ARMEUserStudyController : MonoBehaviour
         return true;
     }
 
-    /// <summary>Start audio + video for every part from the top, in lockstep at native speed.</summary>
+    /// <summary>
+    /// Start audio + video for every part from the top. Per part, decide the audio path now
+    /// that the native controller (if any) has had a chance to initialise: use the native
+    /// pitch-preserving stretcher if it is ready, otherwise fall back to AudioSource.pitch on
+    /// the real clip so the part still sounds even when the native library can't load.
+    /// </summary>
     private void StartVideos()
     {
-        _ensembleSpeed = 1f;
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
 
+            part.onsetIndex = 0;
+            part.currentRate = 1f;
+            part.effectiveInterval = 0f;
+            part.finished = false;
+            part.speed = 1f;
+
+            part.useNativeAudio = part.controller != null && part.controller.IsReady;
+
             if (part.audioSource != null)
             {
                 part.audioSource.pitch = 1f;
-                part.audioSource.time = 0f;
-                part.audioSource.Play();
+
+                if (part.useNativeAudio)
+                {
+                    // Native path: AudioSource plays a silent keep-alive clip so Unity keeps
+                    // calling the controller's OnAudioFilterRead, which fills it with the
+                    // time-stretched (pitch-preserved) audio.
+                    part.audioSource.clip = _dspKeepAlive;
+                    part.audioSource.loop = true;
+                    part.audioSource.Play();
+                    part.controller.StartPlayback();
+                }
+                else
+                {
+                    // Fallback: remove the (non-working) controller so its OnAudioFilterRead
+                    // can't silence the output, then play the real clip directly; tempo will
+                    // be driven via AudioSource.pitch in ApplyPartRate.
+                    if (part.controller != null)
+                    {
+                        Destroy(part.controller);
+                        part.controller = null;
+                    }
+                    part.audioSource.clip = part.audioClip;
+                    part.audioSource.loop = false;
+                    part.audioSource.time = 0f;
+                    part.audioSource.Play();
+                }
             }
 
             if (part.video != null)
@@ -564,17 +555,27 @@ public class ARMEUserStudyController : MonoBehaviour
                 part.video.time = 0.0;
                 part.video.Play();
             }
+        }
+        _ensembleMeanRate = 1f;
 
-            part.speed = 1f;
+        if (verboseLogging)
+        {
+            int nativeCount = 0;
+            foreach (var p in videoParts) if (p != null && p.useNativeAudio) nativeCount++;
+            Log($"Playback started. Audio path: {nativeCount}/{videoParts.Count} parts native (pitch-preserving), " +
+                $"rest using AudioSource.pitch fallback.");
         }
     }
 
     void Update()
     {
-        // Deferred video start: wait until every clip has prepared (or a timeout) so the
-        // pictures begin together.
+        // Deferred start: wait until every clip has prepared and every native controller is
+        // ready (or a timeout) so audio and picture begin together.
         if (_videosPending)
         {
+            // Wait for the videos to prepare (by which point each part's native controller has
+            // had its Start() run and settled to ready-or-failed), then begin. Timeout guards
+            // against a clip that never prepares.
             if (AllVideosPrepared() || Time.time - _videoArmTime > 5f)
             {
                 _videosPending = false;
@@ -583,20 +584,22 @@ public class ARMEUserStudyController : MonoBehaviour
         }
 
         // If the user changed the mode in the inspector at runtime, re-initialise.
-        if (mode != currentMode) InitVirtualsForMode();
+        if (mode != currentMode) ApplyModeReset();
 
         HandleUserTap();
         DetectIdleRevert();
-        DriveVirtualBlinks();
 
-        // Drive every part at one shared, smoothly-ramped tempo (follows the user while
-        // engaged, eases back to native 1× otherwise).
-        UpdateEnsembleTempo();
+        if (_videosPending)
+            return;
+
+        UpdateEnsembleMeanRate();
+        for (int i = 0; i < videoParts.Count; i++)
+            DrivePartWarp(videoParts[i], i);
     }
 
     /// <summary>
     /// True while the user is actively tapping and the ensemble is following them (Adaptive
-    /// or Agentic). Until then — and after an idle revert — the videos play normally.
+    /// or Agentic). Until then — and after an idle revert — the parts play at recorded tempo.
     /// </summary>
     private bool VideosEngaged => adaptiveMode;
 
@@ -608,33 +611,7 @@ public class ARMEUserStudyController : MonoBehaviour
         float t = Time.time;
         userTapCount++;
 
-        // Register user onset to the model using an explicit, monotonically increasing
-        // beat index. All players' onsets for the same beat share this index so ARME
-        // can correlate them as ensemble partners.
-        _currentBeatIndex++;
-        try
-        {
-            _model.RegisterOnsetWithIndex(UserPlayerIndex, t, _currentBeatIndex);
-            _onsetCounts[UserPlayerIndex]++;
-        }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] User onset register failed: {ex.Message}"); }
-
-        // Flush any pending virtual blinks into this beat slot. Virtuals fire on their
-        // own clock between user taps; we record the blink time and only commit it to
-        // ARME here, paired with the user's beat index.
-        for (int i = 1; i < TotalPlayers; i++)
-        {
-            if (_pendingBlinkTime[i] < 0f) continue;
-            try
-            {
-                _model.RegisterOnsetWithIndex(i, _pendingBlinkTime[i], _currentBeatIndex);
-                _onsetCounts[i]++;
-            }
-            catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} flush register failed: {ex.Message}"); }
-            _pendingBlinkTime[i] = -1f;
-        }
-
-        // Measure inter-tap interval and smooth it into the user's IOI estimate.
+        // Measure inter-tap interval and smooth it into the user's IOI estimate (the tapped beat).
         float interval = (_previousUserTapTime > 0f) ? (t - _previousUserTapTime) : 0f;
         if (interval > 0.05f && interval < 5f)
         {
@@ -649,125 +626,31 @@ public class ARMEUserStudyController : MonoBehaviour
         lastUserTapTime = t;
 
         OnUserTap?.Invoke(new UserStudyTapEvent(t, userTapCount, interval, measuredUserIOI, currentUserBPM, mode, adaptiveMode));
+        Log($"USER TAP #{userTapCount} @ t={t:F3}s  Δ={interval:F3}s  measuredIOI={measuredUserIOI:F3}s  BPM={currentUserBPM:F1}  mode={mode}");
 
-        Log($"USER TAP #{userTapCount} @ t={t:F3}s  Δ={interval:F3}s  measuredIOI={measuredUserIOI:F3}s  BPM={currentUserBPM:F1}  totalUserOnsets={_onsetCounts[UserPlayerIndex]} mode={mode}");
-
-        // Non-Adaptive mode ignores user taps for timing — they're recorded only for logging/model state.
+        // Non-Adaptive ignores the user for timing (recorded tempo). [AMUSER non-agentic]
         if (mode == EnsembleMode.NonAdaptive) return;
 
         // Need at least one IOI measurement to drive adaptation.
         if (measuredUserIOI <= 0f) return;
 
-        // Adaptive: transition Random -> follower on first measured IOI.
-        if (mode == EnsembleMode.Adaptive && !adaptiveMode)
+        // Adaptive / Agentic engage on the first usable tap, then follow the user.
+        if (!adaptiveMode)
         {
             adaptiveMode = true;
             OnModeChange?.Invoke(new UserStudyModeEvent(t, mode, true,
-                $"Adaptive activated: IOI={measuredUserIOI:F3}s BPM={currentUserBPM:F1}"));
-            Log($">>> Switching to ADAPTIVE mode. Initial userIOI={measuredUserIOI:F3}s, BPM={currentUserBPM:F1}");
-            for (int i = 1; i < TotalPlayers; i++)
-            {
-                _virtualIOI[i] = measuredUserIOI;
-                // Reset phase so virtuals start aligned to the user's beat instead of
-                // their random pre-activation schedule.
-                _nextBlinkTime[i] = t + measuredUserIOI + phaseOffsetPerPlayer * i;
-                Log($"  -> P{i} virtualIOI={measuredUserIOI:F3}s, nextBlink reset to {_nextBlinkTime[i]:F3}s");
-            }
+                $"{mode} engaged: IOI={measuredUserIOI:F3}s BPM={currentUserBPM:F1}"));
+            Log($">>> {mode} engaged. userIOI={measuredUserIOI:F3}s, BPM={currentUserBPM:F1}");
         }
-
-        // Agentic mode is always "weakly adapting" once the user is tapping.
-        if (mode == EnsembleMode.Agentic)
-        {
-            if (!adaptiveMode)
-                OnModeChange?.Invoke(new UserStudyModeEvent(t, mode, true, "Agentic active: user tapping"));
-            adaptiveMode = true;
-        }
-
-        ApplyCorrections(t);
     }
 
     /// <summary>
-    /// Resolve the active coupling gains for the current mode and sync-tightness preset.
-    /// Agentic always uses its own weak gains; Adaptive uses the preset (or Custom = inspector values).
+    /// If the user stops tapping past the idle threshold, disengage so the parts ease back to
+    /// the recording's own tempo. (Adaptive / Agentic only.)
     /// </summary>
-    private void GetEffectiveGains(out float effAlpha, out float effBeta)
-    {
-        if (mode == EnsembleMode.Agentic)
-        {
-            effAlpha = agenticAlpha;
-            effBeta  = agenticBeta;
-            return;
-        }
-
-        switch (syncTightness)
-        {
-            case SyncTightness.MusicalLoose: effAlpha = 0.30f; effBeta = 0.15f; break;
-            case SyncTightness.MusicalTight: effAlpha = 0.60f; effBeta = 0.35f; break;
-            case SyncTightness.SnapToBeat:   effAlpha = 1.00f; effBeta = 1.00f; break;
-            case SyncTightness.Custom:
-            default:                         effAlpha = alpha; effBeta = beta;  break;
-        }
-    }
-
-    private void ApplyCorrections(float now)
-    {
-        GetEffectiveGains(out float effectiveAlpha, out float effectiveBeta);
-
-        // Get ARME's predictions; these become the phase-correction targets.
-        float[] predictions = null;
-        try { predictions = _model.PredictNextOnsets(); }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] PredictNextOnsets failed: {ex.Message}"); }
-
-        if (predictions != null)
-        {
-            var sb = new StringBuilder();
-            sb.Append("PREDICTIONS @ t=").Append(now.ToString("F3")).Append("s   ");
-            for (int i = 0; i < predictions.Length; i++)
-            {
-                sb.Append('P').Append(i).Append('=').Append(predictions[i].ToString("F3"))
-                  .Append("s (Δ=").Append((predictions[i] - now).ToString("+0.000;-0.000;0.000")).Append(") ");
-            }
-            Log(sb.ToString());
-        }
-
-        for (int i = 1; i < TotalPlayers; i++)
-        {
-            float offset = phaseOffsetPerPlayer * i;
-            float idealNext;
-            string targetSource;
-
-            if (predictions != null && predictions[i] > now)
-            {
-                idealNext = predictions[i] + offset;
-                targetSource = $"ARME predicted={predictions[i]:F3}";
-            }
-            else
-            {
-                // Fallback: derive ideal next from user's tap + measured IOI.
-                idealNext = now + measuredUserIOI + offset;
-                targetSource = "fallback (user tap + measured IOI)";
-            }
-
-            float oldNext = _nextBlinkTime[i];
-            float oldIOI = _virtualIOI[i];
-
-            // Phase correction: pull next-blink time toward ideal by alpha fraction of the error.
-            float phaseError = _nextBlinkTime[i] - idealNext;
-            _nextBlinkTime[i] -= effectiveAlpha * phaseError;
-
-            // Period correction: blend internal IOI toward user's measured IOI by beta.
-            _virtualIOI[i] = (1f - effectiveBeta) * _virtualIOI[i] + effectiveBeta * measuredUserIOI;
-
-            Log($"  -> P{i} target={idealNext:F3}s ({targetSource})  phaseErr={phaseError:+0.000;-0.000}s  " +
-                $"nextBlink {oldNext:F3} -> {_nextBlinkTime[i]:F3} (Δ={_nextBlinkTime[i] - oldNext:+0.000;-0.000})  " +
-                $"IOI {oldIOI:F3} -> {_virtualIOI[i]:F3} (target {measuredUserIOI:F3}, α={effectiveAlpha:F2}, β={effectiveBeta:F2})");
-        }
-    }
-
     private void DetectIdleRevert()
     {
-        // Only Adaptive mode has a Random<->Adaptive sub-state to revert.
-        if (mode != EnsembleMode.Adaptive || !adaptiveMode) return;
+        if (!adaptiveMode || mode == EnsembleMode.NonAdaptive) return;
 
         float now = Time.time;
         float idleSec = (lastUserTapTime > 0f) ? (now - lastUserTapTime) : float.PositiveInfinity;
@@ -777,155 +660,104 @@ public class ARMEUserStudyController : MonoBehaviour
         {
             adaptiveMode = false;
             OnModeChange?.Invoke(new UserStudyModeEvent(now, mode, false,
-                $"Reverted to Random: idle {idleSec:F2}s > threshold {threshold:F2}s"));
-            Log($"<<< User idle for {idleSec:F2}s (> {threshold:F2}s) — reverting to RANDOM mode");
-            // Re-randomise virtual IOIs so future blinks scatter again, and drop any
-            // pending blink registrations (they would belong to a stale beat).
-            for (int i = 1; i < TotalPlayers; i++)
-            {
-                _virtualIOI[i] = Random.Range(minRandomInterval, maxRandomInterval);
-                _pendingBlinkTime[i] = -1f;
-            }
+                $"Disengaged (idle {idleSec:F2}s > {threshold:F2}s) — easing back to recorded tempo"));
+            Log($"<<< Idle {idleSec:F2}s (> {threshold:F2}s) — disengaging, parts return to recorded tempo");
         }
     }
 
-    private void DriveVirtualBlinks()
+    /// <summary>Mean of all parts' current playback-rate; used for Agentic ensemble coupling.</summary>
+    private void UpdateEnsembleMeanRate()
     {
-        float now = Time.time;
-        for (int i = 1; i < TotalPlayers; i++)
+        float sum = 0f; int n = 0;
+        foreach (var part in videoParts)
         {
-            if (now < _nextBlinkTime[i]) continue;
-
-            float onsetTime = _nextBlinkTime[i];
-
-            switch (mode)
-            {
-                case EnsembleMode.NonAdaptive:
-                    ScheduleNonAdaptiveBlink(i, onsetTime);
-                    break;
-
-                case EnsembleMode.Agentic:
-                    ScheduleAgenticBlink(i, onsetTime);
-                    break;
-
-                case EnsembleMode.Adaptive:
-                default:
-                    ScheduleAdaptiveBlink(i, onsetTime, now);
-                    break;
-            }
+            if (part == null) continue;
+            sum += part.currentRate; n++;
         }
-    }
-
-    private void ScheduleAdaptiveBlink(int i, float onsetTime, float now)
-    {
-        if (adaptiveMode)
-        {
-            // Defer ARME registration until the next user tap, where the shared beat
-            // slot is known. Overwriting any earlier pending blink is intentional:
-            // if the virtual fires faster than the user, only the most recent blink
-            // counts for the upcoming beat.
-            _pendingBlinkTime[i] = onsetTime;
-
-            _nextBlinkTime[i] = onsetTime + _virtualIOI[i];
-            Log($"P{i} BLINK (adaptive) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  next={_nextBlinkTime[i]:F3}s  pendingForBeat={_currentBeatIndex + 1}");
-            OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], _virtualIOI[i], _nextBlinkTime[i], "adaptive"));
-        }
-        else
-        {
-            // Pre-tap "Random" sub-state: don't pollute the model.
-            float nextInterval = Random.Range(minRandomInterval, maxRandomInterval);
-            _nextBlinkTime[i] = now + nextInterval;
-            Log($"P{i} BLINK (random) @ t={onsetTime:F3}s  nextInterval={nextInterval:F3}s  next={_nextBlinkTime[i]:F3}s");
-            OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], nextInterval, _nextBlinkTime[i], "random"));
-        }
-    }
-
-    private void ScheduleNonAdaptiveBlink(int i, float onsetTime)
-    {
-        // Strict metronome — fixed IOI, no noise, no model coupling.
-        float ioi = _virtualBaselineIOI[i];
-        _nextBlinkTime[i] = onsetTime + ioi;
-        Log($"P{i} BLINK (non-adaptive) @ t={onsetTime:F3}s  IOI={ioi:F3}s  next={_nextBlinkTime[i]:F3}s");
-        OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], ioi, _nextBlinkTime[i], "non-adaptive"));
-    }
-
-    private void ScheduleAgenticBlink(int i, float onsetTime)
-    {
-        // Pull current IOI back toward the agent's own baseline so it doesn't drift forever.
-        float baseline = _virtualBaselineIOI[i];
-        _virtualIOI[i] = (1f - agenticBaselinePull) * _virtualIOI[i] + agenticBaselinePull * baseline;
-
-        // Per-blink Gaussian timing jitter — the "noise" that makes agents feel alive.
-        float jitter = NextGaussian() * agenticTimingNoise;
-        float interval = Mathf.Max(0.05f, _virtualIOI[i] + jitter);
-
-        // Register to the model so it still informs predictions for any adapting partners.
-        try
-        {
-            _model.RegisterOnset(i, onsetTime);
-            _onsetCounts[i]++;
-        }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] P{i} register failed: {ex.Message}"); }
-
-        _nextBlinkTime[i] = onsetTime + interval;
-        Log($"P{i} BLINK (agentic) @ t={onsetTime:F3}s  IOI={_virtualIOI[i]:F3}s  jitter={jitter:+0.000;-0.000}s  interval={interval:F3}s  next={_nextBlinkTime[i]:F3}s");
-        OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(onsetTime, i, _onsetCounts[i], interval, _nextBlinkTime[i], "agentic"));
-    }
-
-    /// <summary>Box-Muller standard-normal sample (mean 0, stddev 1).</summary>
-    private float NextGaussian()
-    {
-        if (_haveSpawnGaussian)
-        {
-            _haveSpawnGaussian = false;
-            return _spareGaussian;
-        }
-        float u1, u2;
-        do { u1 = Random.value; } while (u1 <= float.Epsilon);
-        u2 = Random.value;
-        float mag = Mathf.Sqrt(-2f * Mathf.Log(u1));
-        float z0 = mag * Mathf.Cos(2f * Mathf.PI * u2);
-        _spareGaussian = mag * Mathf.Sin(2f * Mathf.PI * u2);
-        _haveSpawnGaussian = true;
-        return z0;
+        _ensembleMeanRate = (n > 0) ? sum / n : 1f;
     }
 
     /// <summary>
-    /// Drive the whole ensemble — every video part and its audio — at ONE shared playback
-    /// speed, smoothly ramped toward the target so tempo changes don't jolt the decoder or the
-    /// audio. While engaged the target is the user's tapped tempo (currentUserBPM / naturalBPM);
-    /// otherwise it eases back to native 1×. Giving every part the identical speed keeps the
-    /// quartet locked together (the four clips are one synchronized recording). The video pitch
-    /// follows via AudioSource.pitch so sound and picture stay in step.
+    /// The tempo ratio (× native speed) a part should target right now, by mode — the AMUSER
+    /// desired-interval logic expressed as a rate so it works with note-level onset files:
+    ///   NonAdaptive → 1 (recorded tempo);
+    ///   Adaptive    → user's tempo (currentUserBPM / naturalBPM);
+    ///   Agentic     → 0.7·user + 0.3·ensemble-mean.
     /// </summary>
-    private void UpdateEnsembleTempo()
+    private float TargetRate()
     {
-        if (_videosPending || videoParts.Count == 0)
-            return;
-
-        float target = (VideosEngaged && currentUserBPM > 1e-3f)
-            ? Mathf.Clamp(currentUserBPM / naturalBPM, minPlaybackSpeed, maxPlaybackSpeed)
+        float userRate = (VideosEngaged && currentUserBPM > 1e-3f)
+            ? Mathf.Clamp(currentUserBPM / Mathf.Max(naturalBPM, 1f), minPlaybackSpeed, maxPlaybackSpeed)
             : 1f;
 
-        _ensembleSpeed = Mathf.Lerp(_ensembleSpeed, target, Time.deltaTime * speedSmoothRate);
-        if (Mathf.Abs(_ensembleSpeed - target) < 0.005f)
-            _ensembleSpeed = target; // settle exactly instead of asymptoting forever
-
-        foreach (var part in videoParts)
+        switch (currentMode)
         {
-            if (part == null)
-                continue;
+            case EnsembleMode.NonAdaptive:
+                return 1f;
+            case EnsembleMode.Agentic:
+                float ens = _ensembleMeanRate > 0f ? _ensembleMeanRate : userRate;
+                return agenticUserWeight * userRate + (1f - agenticUserWeight) * ens;
+            case EnsembleMode.Adaptive:
+            default:
+                return userRate;
+        }
+    }
 
-            // Skip writes once this part already matches — no point spamming the decoder every
-            // frame after the tempo has settled.
-            if (Mathf.Abs(_ensembleSpeed - part.speed) < 0.002f)
-                continue;
-            part.speed = _ensembleSpeed;
+    /// <summary>
+    /// Per-part, per-onset warp on the part's OWN clock (its VideoPlayer.time). When the part
+    /// reaches recorded onset i, set the playback rate for the upcoming segment [i, i+1] so that
+    /// onset's spacing matches the target tempo — exactly AMUSER's calculateNextPlaybackRate.
+    /// The rate is produced by the Timing Model bridge and applied to both the picture
+    /// (VideoPlayer.playbackSpeed) and the audio (native pitch-preserving time-stretch).
+    /// </summary>
+    private void DrivePartWarp(VideoPart part, int index)
+    {
+        if (part == null || part.finished) return;
+        var onsets = part.onsets;
+        if (onsets == null || onsets.Count < 2) return;
+        if (part.video == null || !part.video.isPrepared) return;
 
-            if (part.video != null && part.video.isPrepared && part.video.canSetPlaybackSpeed)
-                part.video.playbackSpeed = _ensembleSpeed;
-            if (part.audioSource != null)
-                part.audioSource.pitch = _ensembleSpeed;
+        int i = part.onsetIndex;
+        if (i >= onsets.Count - 1) { part.finished = true; return; }
+
+        // Hold the current segment's rate until this part's clock reaches the next onset.
+        if (part.video.time < onsets[i]) return;
+
+        // Reached onset i — choose the rate for the segment [onset i, onset i+1].
+        float scoreInterval = onsets[i + 1] - onsets[i];
+        float targetRate = TargetRate();
+        float desiredInterval = scoreInterval / Mathf.Max(targetRate, 1e-3f);
+
+        float rate = _timingBridge.CalculateAVPlaybackRate(onsets[i], scoreInterval, desiredInterval);
+        rate = Mathf.Clamp(rate, minPlaybackSpeed, maxPlaybackSpeed);
+
+        ApplyPartRate(part, rate);
+        part.effectiveInterval = desiredInterval;
+        part.onsetIndex = i + 1;
+
+        OnVirtualBlink?.Invoke(new UserStudyBlinkEvent(
+            Time.time, index + 1, part.onsetIndex, desiredInterval, 0f, currentMode.ToString()));
+    }
+
+    /// <summary>Apply a part's tempo ratio to its picture and its audio (native or fallback).</summary>
+    private void ApplyPartRate(VideoPart part, float rate)
+    {
+        part.currentRate = rate;
+        part.speed = rate;
+
+        if (part.video != null && part.video.isPrepared && part.video.canSetPlaybackSpeed)
+            part.video.playbackSpeed = rate;
+
+        if (part.useNativeAudio && part.controller != null)
+        {
+            // Native time-stretch ratio is output/input duration = 1/rate, so the audio plays
+            // at 'rate' while pitch is preserved.
+            part.controller.SetSpeed(1f / Mathf.Max(rate, 1e-3f));
+        }
+        else if (part.audioSource != null)
+        {
+            // Fallback: rate-based — pitch shifts with tempo (like AMUSER's AVAudioPlayer.rate).
+            part.audioSource.pitch = rate;
         }
     }
 
@@ -934,53 +766,55 @@ public class ARMEUserStudyController : MonoBehaviour
         if (verboseLogging) Debug.Log("[UserStudy] " + msg);
     }
 
-    [Button("Reset Model & Restart")]
+    [Button("Reset & Restart")]
     private void ResetAll()
     {
-        if (_model == null) return;
-
-        try
-        {
-            _model.Reset();
-            _model.CreateNewParameters();
-        }
-        catch (System.Exception ex) { Debug.LogWarning($"[UserStudy] Reset failed: {ex.Message}"); }
-
         userTapCount = 0;
         currentUserBPM = 0f;
         measuredUserIOI = 0f;
         lastUserTapTime = 0f;
         _previousUserTapTime = -1f;
-        _currentBeatIndex = 0;
+        _ensembleMeanRate = 1f;
 
-        for (int i = 0; i < TotalPlayers; i++)
-        {
-            _onsetCounts[i] = 0;
-            _pendingBlinkTime[i] = -1f;
-        }
-
-        // Rewind every video + audio part back to the top.
-        _ensembleSpeed = 1f;
         foreach (var part in videoParts)
         {
             if (part == null)
                 continue;
-            if (part.audioSource != null)
+
+            part.onsetIndex = 0;
+            part.currentRate = 1f;
+            part.effectiveInterval = 0f;
+            part.finished = false;
+            part.speed = 1f;
+
+            if (part.useNativeAudio && part.controller != null)
             {
+                // Native path: rewind the stretcher and restart; keep-alive source stays running.
+                part.controller.ResetPlayback();
+                part.controller.StartPlayback();
+                if (part.audioSource != null)
+                {
+                    part.audioSource.pitch = 1f;
+                    if (!part.audioSource.isPlaying) part.audioSource.Play();
+                }
+            }
+            else if (part.audioSource != null)
+            {
+                // Fallback path: rewind and replay the real clip at normal pitch.
                 part.audioSource.pitch = 1f;
                 part.audioSource.time = 0f;
                 part.audioSource.Play();
             }
+
             if (part.video != null)
             {
                 part.video.playbackSpeed = 1f;
                 part.video.time = 0.0;
                 part.video.Play();
             }
-            part.speed = 1f;
         }
 
-        InitVirtualsForMode();
+        ApplyModeReset();
         Log($"RESET complete. Mode={mode}.");
     }
 
@@ -999,7 +833,8 @@ public class ARMEUserStudyController : MonoBehaviour
             if (part.matInstance != null)
                 Destroy(part.matInstance);
         }
-        _model?.Dispose();
+        // Per-part controllers live on child GameObjects; they dispose their own native
+        // resources in their OnDestroy when this object's children are destroyed.
     }
 
 #if UNITY_EDITOR
