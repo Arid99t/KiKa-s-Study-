@@ -780,6 +780,22 @@ namespace ARMEPlayback
         public bool IsPlaying => isPlaying;
 
         /// <summary>
+        /// True once the native playback controller has been created and the audio buffer
+        /// loaded. Used by external drivers to gate StartPlayback() until init has run.
+        /// </summary>
+        public bool IsReady => _isInitialized;
+
+        /// <summary>
+        /// Toggle this controller's verbose console logging (the init/onset chatter).
+        /// Lets an external driver create the component quietly at runtime.
+        /// </summary>
+        public bool EnableDebugLogging
+        {
+            get => enableDebugLogging;
+            set => enableDebugLogging = value;
+        }
+
+        /// <summary>
         /// Get the amount of padding applied to the audio buffer
         /// </summary>
         public float GetAppliedPadding()
