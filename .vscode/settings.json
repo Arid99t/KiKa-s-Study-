@@ -56,5 +56,5 @@
         "temp/": true,
         "Temp/": true
     },
-    "dotnet.defaultSolution": "ARME-Library-Test.slnx"
+    "dotnet.defaultSolution": "TempSiyu.slnx"
 }

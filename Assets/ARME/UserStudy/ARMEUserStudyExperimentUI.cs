@@ -11,13 +11,15 @@ using UnityEngine.InputSystem.UI;
 /// drives the session via <see cref="ARMEUserStudySession"/>:
 ///
 ///   Demographics screen (ID / age / gender / musical training)
+///     → 3 practice trials (AudioVisual + Adaptive; shown as "Practice n of 3", data discarded)
 ///     → condition picker (six "modes", shown with neutral "Condition n" labels so participants
 ///       never see the interactivity names)
 ///         → the chosen block runs N reps; each rep:
 ///              ready screen (participants only ever see a running "Trial n" number)
 ///                → count-in at the standardised speed (tap/click along to set the tempo)
-///                → one take (the ensemble plays one pass, following the participant)
-///         → 4-item VAS questionnaire (0–100 sliders) for the block
+///                → one take (each tap fires Violin 1's next note; the other three musicians
+///                  synchronise to Violin 1, with the timing model predicting their onsets)
+///         → 5-item VAS questionnaire (0–100 sliders) for the block
 ///         → back to the picker (completed conditions are marked)
 ///     → Finish &amp; Save → thank-you screen (the data logger saves on session complete).
 ///
@@ -38,11 +40,13 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
     [Tooltip("Fallback seconds-per-count used only if no session provides the standard speed.")]
     [SerializeField] private float fallbackSecondsPerCount = 0.5f;
 
-    // VAS questionnaire items (poster's four subjective measures), rated 0–100 on sliders.
+    // VAS questionnaire items rated 0–100 on sliders. Order must match OnQuestionnaireSubmit's
+    // mapping into RatingsData.
     private static readonly string[] RatingItems =
     {
         "How in sync did you feel with the ensemble?",
-        "How easy was it to coordinate with the ensemble?",
+        "How easy was it to stay in sync with the ensemble?",
+        "How realistic did the interaction feel?",
         "How engaged did you feel during the take?",
         "How much did you feel the ensemble responded to you (sense of agency)?",
     };
@@ -81,7 +85,8 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
 
     // Ready screen.
     private Text _readyText;
-    private int _trialNumber;   // running participant-facing trial count across the session
+    private int _trialNumber;      // running participant-facing trial count across the session
+    private bool _isPracticeTrial; // current trial is practice (shows the "Violin 1" tag)
 
     // Questionnaire (VAS sliders).
     private readonly float[]  _ratingValues  = new float[RatingItems.Length];
@@ -91,6 +96,7 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
 
     // HUD / tempo meter.
     private GameObject _hudBlackout;   // full-screen black, shown only in audio-only takes
+    private GameObject _violin1Label;  // "Violin 1 ▼" tag over the leader — practice takes only
     private Text _countdownText;
     private const float MinBPM = 40f, MaxBPM = 200f;
     private const float TempoTrackWidth = 560f;
@@ -127,6 +133,7 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         {
             session.OnTrialStarted     += HandleTrialStarted;
             session.OnBlockEnded       += HandleBlockEnded;
+            session.OnPracticeEnded    += HandlePracticeEnded;
             session.OnRatingsSubmitted += HandleRatingsSubmitted;
             session.OnSessionComplete  += HandleSessionComplete;
         }
@@ -142,6 +149,7 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         {
             session.OnTrialStarted     -= HandleTrialStarted;
             session.OnBlockEnded       -= HandleBlockEnded;
+            session.OnPracticeEnded    -= HandlePracticeEnded;
             session.OnRatingsSubmitted -= HandleRatingsSubmitted;
             session.OnSessionComplete  -= HandleSessionComplete;
         }
@@ -159,7 +167,30 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         if (_hudPanel != null && _hudPanel.activeSelf && controller != null)
         {
             UpdateTempoMeter(controller.currentUserBPM);
+            if (_violin1Label != null && _violin1Label.activeSelf)
+                PositionViolin1Label();
         }
+    }
+
+    /// <summary>Keep the practice-only "Violin 1 ▼" tag hovering just above the Violin 1 plane.</summary>
+    private void PositionViolin1Label()
+    {
+        var rend = controller.LeaderRenderer;
+        var cam = Camera.main;
+        if (cam == null) cam = FindFirstObjectByType<Camera>();
+        if (rend == null || cam == null)
+        {
+            // Park off-screen (don't deactivate — the references may resolve a frame later).
+            _violin1Label.transform.position = new Vector3(-2000f, -2000f, 0f);
+            return;
+        }
+
+        // Top-centre of the musician's plane projected to the screen. On a screen-space
+        // overlay canvas, UI positions ARE screen pixels, so it can be set directly.
+        Vector3 top = rend.bounds.center + Vector3.up * rend.bounds.extents.y;
+        Vector3 sp = cam.WorldToScreenPoint(top);
+        if (sp.z <= 0f) return;   // behind the camera — keep the last position
+        _violin1Label.transform.position = new Vector3(sp.x, sp.y + 8f, 0f);
     }
 
     // ── Flow ─────────────────────────────────────────────────────────────
@@ -178,7 +209,9 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         {
             id = id, age = age, gender = _selectedGender, musicalTrainingYears = training
         });
-        ShowPicker();
+        // Practice comes first (fires OnTrialStarted → ready screen); the picker is shown once
+        // OnPracticeEnded fires (immediately if practice is disabled in the session inspector).
+        session.StartPracticeBlock();
     }
 
     private void OnPickerSelect(int conditionId)
@@ -195,18 +228,41 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
     private void HandleTrialStarted(TrialInfo info)
     {
         if (controller != null) controller.AcceptTaps = false;
-        _trialNumber++;
-        // Participants only ever see a running trial number — never the condition name, so the
-        // labels can't shape their expectations of how the ensemble will behave.
+        _isPracticeTrial = info.isPractice;
+
+        // Participants only ever see a running trial number (or "Practice n of N") — never the
+        // condition name, so the labels can't shape their expectations of how the ensemble
+        // will behave.
+        string heading;
+        if (info.isPractice)
+        {
+            int total = session != null ? session.PracticeTrials : 3;
+            heading = $"Practice {info.repIndex} of {total}\n" +
+                      "A practice round so you can get familiar with the task.\n";
+        }
+        else
+        {
+            _trialNumber++;
+            heading = $"Trial {_trialNumber}\n";
+        }
+
         if (_readyText != null)
         {
             _readyText.text =
-                $"Trial {_trialNumber}\n\n" +
-                "Press Begin. A short count-in will play — tap along with it to set your starting tempo.\n" +
-                "Once the music begins, continue tapping at the same steady tempo established during the countdown while interacting with the virtual ensemble until the trial ends.\n" +
+                heading + "\n" +
+                "Press Begin. A short countdown will play — tap along with it to establish your starting tempo.\n" +
+                "Once the music begins, tap once for each note played by Violin 1 and continue tapping while " +
+                "paying attention to the other musicians, trying to stay in time with the ensemble, " +
+                "just as you would when performing with a real musical group.\n" +
                 "The way the ensemble responds to your timing may vary across trials.";
         }
         ShowOnly(_readyPanel);
+    }
+
+    private void HandlePracticeEnded()
+    {
+        if (controller != null) { controller.AcceptTaps = false; controller.StopPlayback(); }
+        ShowPicker();
     }
 
     private void OnReadyBeginPressed()
@@ -222,6 +278,11 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         // Audio-only → black screen (videos hidden); keep the metronome + texts visible on top.
         bool audioOnly = controller != null && controller.CurrentModality == Modality.AudioOnly;
         if (_hudBlackout != null) _hudBlackout.SetActive(audioOnly);
+
+        // PRACTICE takes only: hang the "Violin 1 ▼" tag over the leader so participants learn
+        // which musician to tap along with. Never shown in the real experiment trials.
+        if (_violin1Label != null)
+            _violin1Label.SetActive(_isPracticeTrial && !audioOnly);
 
         if (controller != null)
             controller.PrepareForTake();   // fresh model/counters before the count-in taps
@@ -266,8 +327,9 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         {
             perceivedSynchrony = _ratingValues[0],
             easeOfCoordination = _ratingValues[1],
-            engagement         = _ratingValues[2],
-            senseOfAgency      = _ratingValues[3],
+            realism            = _ratingValues[2],
+            engagement         = _ratingValues[3],
+            senseOfAgency      = _ratingValues[4],
         };
         if (session != null) session.SubmitRatings(ratings);
     }
@@ -472,6 +534,33 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
             TextAnchor.MiddleCenter, 600, 320, 0, 0);
 
         BuildTempoMeter(_hudPanel.transform);
+        BuildViolin1Label(_hudPanel.transform);
+    }
+
+    /// <summary>
+    /// "Violin 1 ▼" tag hung over the Violin 1 musician during PRACTICE takes only, so
+    /// participants learn which player to tap along with. Repositioned every frame in
+    /// <see cref="PositionViolin1Label"/>; hidden in the real experiment trials.
+    /// </summary>
+    private void BuildViolin1Label(Transform parent)
+    {
+        _violin1Label = NewUI("Violin1Label", parent);
+        var rt = _violin1Label.GetComponent<RectTransform>();
+        rt.anchorMin = rt.anchorMax = Vector2.zero;   // placed in screen pixels each frame
+        rt.pivot = new Vector2(0.5f, 0f);             // bottom-centre sits just above the plane
+        rt.sizeDelta = new Vector2(360, 96);
+
+        var labelColor = Color.black;   // reads clearly on the study's light backdrop
+
+        var title = AddText(_violin1Label.transform, "Violin 1", 44, FontStyle.Bold,
+            TextAnchor.MiddleCenter, 360, 54, 0, -6);
+        title.color = labelColor;
+
+        var arrow = AddText(_violin1Label.transform, "▼", 40, FontStyle.Bold,
+            TextAnchor.MiddleCenter, 120, 44, 0, -42);
+        arrow.color = labelColor;
+
+        _violin1Label.SetActive(false);
     }
 
     private void BuildQuestionnaire(Transform parent)
@@ -485,7 +574,7 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
         AddText(_questionnairePanel.transform, "Click or drag anywhere along each line to answer.",
             24, FontStyle.Normal, TextAnchor.MiddleCenter, 1200, 40, 0, 360);
 
-        float rowTop = 260, rowGap = 155;
+        float rowTop = 260, rowGap = 130;   // 5 rows fit between the header and the Submit button
         for (int i = 0; i < RatingItems.Length; i++)
         {
             float y = rowTop - i * rowGap;

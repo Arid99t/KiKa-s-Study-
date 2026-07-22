@@ -10,16 +10,20 @@ using NaughtyAttributes;
 /// Data manager for the 2 (Modality) × 3 (Interactivity) SMS study, run as experimenter-picked
 /// condition blocks of several repetitions (trials) each. Subscribes to the
 /// <see cref="ARMEUserStudySession"/> (trial / ratings events) and the
-/// <see cref="ARMEUserStudyController"/> (tap / virtual-onset / playback events), accumulates each
-/// trial's taps and ensemble onsets, then — once a take ends — computes the behavioural measures the
-/// poster asks for (asynchrony = tap − nearest virtual onset, its mean and SD, IOI variability, and
-/// an approximate phase-correction index).
+/// <see cref="ARMEUserStudyController"/> (tap / musician-note / playback events), accumulates each
+/// trial's taps and the ensemble's actually-played note onsets, then — once a take ends — computes
+/// the behavioural measures (asynchrony = tap − nearest VIOLIN 1 note onset, since participants tap
+/// one tap per Violin 1 note; its mean and SD, IOI variability, and an approximate phase-correction
+/// index). Practice trials are discarded entirely — nothing from them is written to any file.
 ///
 /// Output (Desktop/User Study Data/&lt;ParticipantID&gt;/), tidy for repeated-measures ANOVA:
-///   • &lt;PID&gt;_taps.csv    — one row per tap (raw + asynchrony, tagged with condition/rep/speed)
-///   • &lt;PID&gt;_summary.csv — one row per trial (derived metrics + the block's four ratings)
-///   • &lt;PID&gt;_session.csv — demographics + blocks run + engine-config snapshot
-///   • &lt;PID&gt;_onsets.csv  — (optional) every virtual onset, to recompute asynchrony offline
+///   • &lt;PID&gt;_taps.csv            — one row per tap (raw + asynchrony vs Violin 1, condition-tagged)
+///   • &lt;PID&gt;_summary.csv         — one row per trial (derived metrics + the block's five ratings)
+///   • &lt;PID&gt;_session.csv         — demographics + blocks run + engine-config snapshot
+///   • &lt;PID&gt;_musician_onsets.csv — when each virtual musician actually played each note (the
+///                                  ensemble's intended musical timing, for offline analysis)
+///   • &lt;PID&gt;_onsets.csv          — (optional) Violin 1 (P0) played-note onsets plus every
+///                                  follower model blink onset, kept for reference
 /// </summary>
 public class ARMEUserStudyDataLogger : MonoBehaviour
 {
@@ -47,7 +51,13 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
     [SerializeField] private bool saveOnApplicationQuit = true;
 
     [BoxGroup("Save Settings")]
-    [Tooltip("Also write a per-onset file so asynchrony can be recomputed against any reference offline.")]
+    [Tooltip("Write the musician-onsets file: the game time at which each virtual musician actually " +
+             "played each note (the ensemble's intended musical timing).")]
+    [SerializeField] private bool writeMusicianOnsetFile = true;
+
+    [BoxGroup("Save Settings")]
+    [Tooltip("Also write the combined onset file: Violin 1's played-note onsets as Player 0, " +
+             "plus the followers' abstract model blink onsets.")]
     [SerializeField] private bool writeOnsetFile = true;
 
     [BoxGroup("Status")]
@@ -73,6 +83,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         // Filled in the end-of-trial post-pass.
         public float asyncMs;
         public int   nearestPlayer = -1;
+        public int   nearestNote = -1;   // Violin 1 note number the tap was matched to (1-based)
         public bool  asyncValid;
     }
 
@@ -81,6 +92,18 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         public int   player;
         public float gameTime;
         public bool  duringTake;
+    }
+
+    /// <summary>One actually-played musician note (warped audio playhead crossed a source onset).</summary>
+    private struct NoteRecord
+    {
+        public int    partIndex;
+        public string part;
+        public int    noteIndex;    // 1-based within the take
+        public float  sourceTime;   // onset timestamp in the source recording
+        public float  gameTime;     // when the note actually sounded
+        public float  speed;        // playback speed at that moment
+        public bool   isLeader;     // Violin 1 — the participant's tapping target
     }
 
     private class TrialRecord
@@ -92,9 +115,11 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         public bool  finalized;
         public readonly List<TapRecord>   taps   = new List<TapRecord>(128);
         public readonly List<OnsetRecord> onsets = new List<OnsetRecord>(256);
+        public readonly List<NoteRecord>  notes  = new List<NoteRecord>(512);
 
         // Summary metrics (computed in FinalizeTrial).
         public int   numValidTaps;
+        public int   numLeaderNotes;
         public float meanAsyncMs, sdAsyncMs;
         public float meanIOI, sdIOI, cvIOI;
         public float lag1Slope, alphaEst;
@@ -132,6 +157,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         {
             _controller.OnUserTap          += HandleUserTap;
             _controller.OnVirtualBlink     += HandleVirtualBlink;
+            _controller.OnMusicianNote     += HandleMusicianNote;
             _controller.OnPlaybackStarted  += HandlePlaybackStarted;
         }
         else Debug.LogWarning("[DataLogger] ARMEUserStudyController not found in scene.");
@@ -168,6 +194,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         {
             _controller.OnUserTap         -= HandleUserTap;
             _controller.OnVirtualBlink    -= HandleVirtualBlink;
+            _controller.OnMusicianNote    -= HandleMusicianNote;
             _controller.OnPlaybackStarted -= HandlePlaybackStarted;
         }
         if (_session != null)
@@ -190,6 +217,14 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
 
     private void HandleTrialStarted(TrialInfo info)
     {
+        // Practice trials are familiarisation only — record nothing (every handler below
+        // no-ops while _active is null, so no practice data can reach the CSVs).
+        if (info.isPractice)
+        {
+            _active = null;
+            return;
+        }
+
         _active = new TrialRecord { info = info, startTime = Time.time };
         _trials.Add(_active);
         trialsRecorded = _trials.Count;
@@ -230,6 +265,21 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         });
     }
 
+    private void HandleMusicianNote(UserStudyNoteEvent e)
+    {
+        if (_active == null) return;   // notes only fire during a take, so no duringTake flag needed
+        _active.notes.Add(new NoteRecord
+        {
+            partIndex  = e.partIndex,
+            part       = e.partLabel,
+            noteIndex  = e.noteIndex,
+            sourceTime = e.sourceTime,
+            gameTime   = e.gameTime,
+            speed      = e.playbackSpeed,
+            isLeader   = e.isLeader,
+        });
+    }
+
     private void HandleTrialEnded(TrialInfo info)
     {
         if (_active != null) { _active.endTime = Time.time; FinalizeTrial(_active); }
@@ -254,24 +304,41 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
     // ── Behavioural measures (end-of-trial post-pass) ────────────────────
 
     /// <summary>
-    /// Compute each tap's asynchrony against its nearest virtual onset, then the trial-level mean/SD
-    /// asynchrony, IOI variability, and an approximate lag-1 phase-correction index. Asynchrony and
-    /// onset matching use only the during-take window so count-in blinks don't count.
+    /// Compute each tap's asynchrony against its nearest VIOLIN 1 note onset (participants tap one
+    /// tap per Violin 1 note, so the leader's actually-played notes are the reference), then the
+    /// trial-level mean/SD asynchrony, IOI variability, and an approximate lag-1 phase-correction
+    /// index. Falls back to the abstract model blinks if no leader notes were recorded (e.g. a
+    /// missing onset file). Matching uses only the during-take window so count-in taps don't count.
     /// </summary>
     private void FinalizeTrial(TrialRecord c)
     {
         c.finalized = true;
 
-        // Onsets to match against (prefer during-take; fall back to all if no take was detected).
+        // Reference onsets = Violin 1's played notes.
         var onsetTimes = new List<float>();
         var onsetPlayers = new List<int>();
-        bool anyTakeOnsets = false;
-        foreach (var o in c.onsets) if (o.duringTake) anyTakeOnsets = true;
-        foreach (var o in c.onsets)
+        var onsetNotes = new List<int>();
+        foreach (var n in c.notes)
         {
-            if (anyTakeOnsets && !o.duringTake) continue;
-            onsetTimes.Add(o.gameTime);
-            onsetPlayers.Add(o.player);
+            if (!n.isLeader) continue;
+            onsetTimes.Add(n.gameTime);
+            onsetPlayers.Add(n.partIndex);
+            onsetNotes.Add(n.noteIndex);
+        }
+        c.numLeaderNotes = onsetTimes.Count;
+
+        // Fallback: model blink onsets (prefer during-take; all if no take was detected).
+        if (onsetTimes.Count == 0)
+        {
+            bool anyTakeOnsets = false;
+            foreach (var o in c.onsets) if (o.duringTake) anyTakeOnsets = true;
+            foreach (var o in c.onsets)
+            {
+                if (anyTakeOnsets && !o.duringTake) continue;
+                onsetTimes.Add(o.gameTime);
+                onsetPlayers.Add(o.player);
+                onsetNotes.Add(-1);
+            }
         }
 
         // Median IOI → validity window for asynchrony.
@@ -289,6 +356,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
             {
                 t.asyncMs = bestDt * 1000f;            // signed: tap after onset = positive
                 t.nearestPlayer = onsetPlayers[nearest];
+                t.nearestNote = onsetNotes[nearest];
                 t.asyncValid = t.duringTake && Mathf.Abs(t.asyncMs) <= validWindowMs;
                 if (t.asyncValid) validAsync.Add(t.asyncMs);
             }
@@ -296,6 +364,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
             {
                 t.asyncMs = float.NaN;
                 t.nearestPlayer = -1;
+                t.nearestNote = -1;
                 t.asyncValid = false;
             }
         }
@@ -351,6 +420,8 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         WriteTapsFile(Path.Combine(folder, $"{Sanitize(pid)}_taps.csv"), pid);
         WriteSummaryFile(Path.Combine(folder, $"{Sanitize(pid)}_summary.csv"), pid);
         WriteSessionFile(Path.Combine(folder, $"{Sanitize(pid)}_session.csv"), pid);
+        if (writeMusicianOnsetFile)
+            WriteMusicianOnsetFile(Path.Combine(folder, $"{Sanitize(pid)}_musician_onsets.csv"), pid);
         if (writeOnsetFile)
             WriteOnsetFile(Path.Combine(folder, $"{Sanitize(pid)}_onsets.csv"), pid);
 
@@ -366,7 +437,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         var sb = new StringBuilder(16384);
         sb.AppendLine("ParticipantID,ConditionId,BlockOrder,Modality,Interactivity,Rep,CountInSpeed_s," +
                       "TapIndexInTrial,GameTime_s,TimeInTake_s,DuringTake,IOI_s,BPM," +
-                      "Asynchrony_ms,NearestPlayer,AsyncValid,TapSource,Force");
+                      "Asynchrony_ms,NearestPlayer,NearestVN1Note,AsyncValid,TapSource,Force");
 
         foreach (var c in _trials)
         {
@@ -389,6 +460,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
                   .Append(t.bpm > 0f ? F(t.bpm, 2) : "").Append(',')
                   .Append(F(t.asyncMs, 2)).Append(',')
                   .Append(t.nearestPlayer).Append(',')
+                  .Append(t.nearestNote >= 0 ? t.nearestNote.ToString(Inv) : "").Append(',')
                   .Append(t.asyncValid ? 1 : 0).Append(',')
                   .Append(t.isHardware ? "FSR" : "Mouse").Append(',')
                   .Append(t.force)
@@ -402,10 +474,10 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
     {
         var sb = new StringBuilder(8192);
         sb.AppendLine("ParticipantID,ConditionId,BlockOrder,Modality,Interactivity,Rep,CountInSpeed_s," +
-                      "TakeDuration_s,NumTapsTotal,NumValidTaps," +
+                      "TakeDuration_s,NumTapsTotal,NumValidTaps,NumVN1Notes," +
                       "MeanAsync_ms,SDAsync_ms,MeanIOI_s,SDIOI_s,CV_IOI," +
                       "PhaseCorr_Lag1Slope,PhaseCorr_AlphaEst," +
-                      "VAS_PerceivedSync,VAS_Ease,VAS_Engagement,VAS_Agency");
+                      "VAS_PerceivedSync,VAS_Ease,VAS_Realism,VAS_Engagement,VAS_Agency");
 
         foreach (var c in _trials)
         {
@@ -423,6 +495,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
               .Append(F(dur, 2)).Append(',')
               .Append(c.taps.Count).Append(',')
               .Append(c.numValidTaps).Append(',')
+              .Append(c.numLeaderNotes).Append(',')
               .Append(F(c.meanAsyncMs, 2)).Append(',')
               .Append(F(c.sdAsyncMs, 2)).Append(',')
               .Append(F(c.meanIOI, 4)).Append(',')
@@ -432,6 +505,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
               .Append(F(c.alphaEst, 4)).Append(',')
               .Append(R(r.perceivedSynchrony)).Append(',')
               .Append(R(r.easeOfCoordination)).Append(',')
+              .Append(R(r.realism)).Append(',')
               .Append(R(r.engagement)).Append(',')
               .Append(R(r.senseOfAgency))
               .Append('\n');
@@ -453,6 +527,7 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
             sb.AppendLine($"Gender,{CsvEscape(p.gender)}");
             sb.AppendLine($"MusicalTrainingYears,{F(p.musicalTrainingYears, 1)}");
             sb.AppendLine($"RepsPerCondition,{_session.RepsPerCondition}");
+            sb.AppendLine($"PracticeTrials,{_session.PracticeTrials} (not recorded)");
         }
 
         sb.AppendLine($"BlocksRun,{CsvEscape(BlocksRunString())}");
@@ -480,6 +555,43 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
     }
 
+    /// <summary>
+    /// One row per note a virtual musician actually played: the moment its (tempo-warped) audio
+    /// crossed one of the recording's onset timestamps. IsLeader marks Violin 1 — the melody the
+    /// participant taps along with — so taps can be compared with the ensemble's intended musical
+    /// timing offline.
+    /// </summary>
+    private void WriteMusicianOnsetFile(string path, string pid)
+    {
+        var sb = new StringBuilder(32768);
+        sb.AppendLine("ParticipantID,ConditionId,BlockOrder,Modality,Interactivity,Rep," +
+                      "Part,PartIndex,IsLeader,NoteIndex,SourceTime_s,GameTime_s,TimeInTake_s,PlaybackSpeed");
+        foreach (var c in _trials)
+        {
+            var info = c.info; var cond = info.condition;
+            foreach (var n in c.notes)
+            {
+                float tInTake = c.playbackStart >= 0f ? n.gameTime - c.playbackStart : float.NaN;
+                sb.Append(CsvEscape(pid)).Append(',')
+                  .Append(cond.conditionId).Append(',')
+                  .Append(cond.index + 1).Append(',')
+                  .Append(cond.modality).Append(',')
+                  .Append(cond.interactivity).Append(',')
+                  .Append(info.repIndex).Append(',')
+                  .Append(CsvEscape(n.part)).Append(',')
+                  .Append(n.partIndex).Append(',')
+                  .Append(n.isLeader ? 1 : 0).Append(',')
+                  .Append(n.noteIndex).Append(',')
+                  .Append(F(n.sourceTime, 4)).Append(',')
+                  .Append(F(n.gameTime, 4)).Append(',')
+                  .Append(F(tInTake, 4)).Append(',')
+                  .Append(F(n.speed, 3))
+                  .Append('\n');
+            }
+        }
+        File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+    }
+
     private void WriteOnsetFile(string path, string pid)
     {
         var sb = new StringBuilder(16384);
@@ -488,7 +600,25 @@ public class ARMEUserStudyDataLogger : MonoBehaviour
         foreach (var c in _trials)
         {
             var info = c.info; var cond = info.condition;
-            foreach (var o in c.onsets)
+
+            // Player 0 is the Violin 1 leader/reference. It does not generate the abstract
+            // follower blinks stored in c.onsets, so merge its actually-played note onsets
+            // into this legacy file to provide a complete P0..PN timing table.
+            var rows = new List<OnsetRecord>(c.onsets.Count + c.notes.Count);
+            rows.AddRange(c.onsets);
+            foreach (var n in c.notes)
+            {
+                if (!n.isLeader) continue;
+                rows.Add(new OnsetRecord
+                {
+                    player = 0,
+                    gameTime = n.gameTime,
+                    duringTake = c.playbackStart >= 0f && n.gameTime >= c.playbackStart,
+                });
+            }
+            rows.Sort((a, b) => a.gameTime.CompareTo(b.gameTime));
+
+            foreach (var o in rows)
             {
                 float tInTake = c.playbackStart >= 0f ? o.gameTime - c.playbackStart : float.NaN;
                 sb.Append(CsvEscape(pid)).Append(',')

@@ -1737,6 +1737,7 @@ MonoBehaviour:
   asyncValidFraction: 0.5
   saveOnSessionComplete: 1
   saveOnApplicationQuit: 1
+  writeMusicianOnsetFile: 1
   writeOnsetFile: 1
   trialsRecorded: 0
   tapsLogged: 0
@@ -3327,9 +3328,11 @@ MonoBehaviour:
   mode: 0
   modality: 1
   autoStart: 1
+  stalledTakeTimeout: 5
   tapDetection: {fileID: 1321317373}
-  numVirtualPlayers: 2
+  numVirtualPlayers: 3
   videoParts: []
+  leaderLabelPrefix: VN1
   manageDisplay: 1
   videoTextureProperty: _TB
   naturalBPM: 120
@@ -3337,6 +3340,9 @@ MonoBehaviour:
   minPlaybackSpeed: 0.25
   maxPlaybackSpeed: 3
   speedSmoothRate: 6
+  armWindowSeconds: 0.03
+  leaderCatchUpGain: 9
+  leaderTempoAveraging: 1.5
   minRandomInterval: 0.4
   maxRandomInterval: 1.2
   syncTightness: 1
@@ -3352,6 +3358,7 @@ MonoBehaviour:
   agenticBaselinePull: 0.25
   agenticAlpha: 0.1
   agenticBeta: 0.05
+  agenticLeaderCohesion: 0.3
   startTempoSpread: 0.04
   convergeSeconds: 4
   phaseCohesionGain: 0.6
@@ -3394,6 +3401,7 @@ MonoBehaviour:
   controller: {fileID: 0}
   participantNumber: 1
   repsPerCondition: 5
+  practiceTrials: 3
   countInSpeedMode: 0
   countInSecondsPerCount: 0.5
   randomCountInSpeeds:

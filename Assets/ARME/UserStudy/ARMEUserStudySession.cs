@@ -57,37 +57,43 @@ public readonly struct ConditionInfo
 public readonly struct TrialInfo
 {
     public readonly ConditionInfo condition;
-    public readonly int   repIndex;       // 1..repsPerCondition
+    public readonly int   repIndex;       // 1..repsPerCondition (or 1..practiceTrials)
     public readonly float countInSpeed;   // seconds per count for this trial
+    public readonly bool  isPractice;     // familiarisation trial — data is NOT recorded
 
-    public TrialInfo(ConditionInfo condition, int repIndex, float countInSpeed)
+    public TrialInfo(ConditionInfo condition, int repIndex, float countInSpeed, bool isPractice = false)
     {
         this.condition = condition; this.repIndex = repIndex; this.countInSpeed = countInSpeed;
+        this.isPractice = isPractice;
     }
 }
 
-/// <summary>The four subjective VAS ratings (0–100 visual analogue scale) collected after each
+/// <summary>The five subjective VAS ratings (0–100 visual analogue scale) collected after each
 /// condition block. Negative = unanswered.</summary>
 public struct RatingsData
 {
     public float perceivedSynchrony;
-    public float easeOfCoordination;
+    public float easeOfCoordination;   // "How easy was it to stay in sync with the ensemble?"
+    public float realism;              // "How realistic did the interaction feel?"
     public float engagement;
     public float senseOfAgency;
 
     public static RatingsData Empty => new RatingsData
     {
-        perceivedSynchrony = -1f, easeOfCoordination = -1f, engagement = -1f, senseOfAgency = -1f
+        perceivedSynchrony = -1f, easeOfCoordination = -1f, realism = -1f,
+        engagement = -1f, senseOfAgency = -1f
     };
 }
 
 /// <summary>
 /// Source of truth for a user-study session. Holds the participant demographics and runs the study
 /// as <b>experimenter-picked condition blocks</b>: the UI shows a 6-condition picker, the experimenter
-/// selects one, and that block runs <see cref="RepsPerCondition"/> repetitions (trials). The count-in
+/// selects one, and that block runs <see cref="RepsPerCondition"/> repetitions (trials). Before the
+/// picker is first shown, <see cref="PracticeTrials"/> practice trials run (AudioVisual + Adaptive)
+/// so participants learn the task; practice data is never saved. The count-in
 /// speed is chosen per the inspector mode: <b>Fixed</b> (every trial uses
 /// <see cref="countInSecondsPerCount"/>) or <b>Random Per Trial</b> (each trial randomly draws one of
-/// <see cref="randomCountInSpeeds"/>). After the reps, the four ratings are collected and control
+/// <see cref="randomCountInSpeeds"/>). After the reps, the five ratings are collected and control
 /// returns to the picker.
 ///
 /// The UI (<see cref="ARMEUserStudyExperimentUI"/>) drives timing/input and the data logger
@@ -117,6 +123,12 @@ public class ARMEUserStudySession : MonoBehaviour
     [SerializeField] private int repsPerCondition = 5;
 
     [BoxGroup("Trials")]
+    [Tooltip("Practice trials run automatically after the demographics screen, before the first " +
+             "condition block. Practice always uses AudioVisual + Adaptive and its data is NOT saved. " +
+             "Set to 0 to skip practice.")]
+    [SerializeField] private int practiceTrials = 3;
+
+    [BoxGroup("Trials")]
     [Tooltip("Fixed → every trial uses Count In Seconds Per Count. Random Per Trial → each trial " +
              "randomly draws its speed from Random Count In Speeds.")]
     [SerializeField] private CountInSpeedMode countInSpeedMode = CountInSpeedMode.Fixed;
@@ -139,11 +151,15 @@ public class ARMEUserStudySession : MonoBehaviour
 
     public const int TotalConditions = 6;
 
+    /// <summary>Condition the practice trials always run in: AudioVisual × Adaptive.</summary>
+    public const int PracticeConditionId = 5;
+
     private ConditionInfo _condition;
     private int     _currentRep;          // 1-based within the active block
     private float   _currentTrialCountInSpeed = 0.5f;   // drawn once per trial
     private int     _blocksStarted;
     private bool    _blockActive;
+    private bool    _isPracticeBlock;     // the active block is the (unrecorded) practice block
     private readonly HashSet<int> _doneConditions = new HashSet<int>();
 
     private bool UsesFixedCountIn  => countInSpeedMode == CountInSpeedMode.Fixed;
@@ -152,9 +168,11 @@ public class ARMEUserStudySession : MonoBehaviour
     public ParticipantInfo Participant { get; private set; }
     public int    ParticipantNumber => participantNumber;
     public int    RepsPerCondition  => Mathf.Max(1, repsPerCondition);
+    public int    PracticeTrials    => Mathf.Max(0, practiceTrials);
+    public bool   InPractice        => _isPracticeBlock;
     public int    ConditionsDone    => _doneConditions.Count;
     public bool   AllConditionsDone => _doneConditions.Count >= TotalConditions;
-    public TrialInfo CurrentTrial   => new TrialInfo(_condition, _currentRep, CurrentCountInSpeed);
+    public TrialInfo CurrentTrial   => new TrialInfo(_condition, _currentRep, CurrentCountInSpeed, _isPracticeBlock);
     public float  CurrentCountInSpeed => _currentTrialCountInSpeed;
 
     public bool IsConditionDone(int conditionId) => _doneConditions.Contains(conditionId);
@@ -163,6 +181,7 @@ public class ARMEUserStudySession : MonoBehaviour
     public event Action<TrialInfo>            OnTrialStarted;    // a rep is ready / starting
     public event Action<TrialInfo>            OnTrialEnded;      // a rep's take finished
     public event Action<int>                  OnBlockEnded;      // all reps done → collect ratings
+    public event Action                        OnPracticeEnded;   // all practice trials done → show picker
     public event Action<int, RatingsData>     OnRatingsSubmitted;
     public event Action                        OnSessionComplete;
 
@@ -177,8 +196,40 @@ public class ARMEUserStudySession : MonoBehaviour
         Participant = info;
         if (TryParseLeadingInt(info.id, out int n) && n > 0) participantNumber = n;
         _blocksStarted = 0;
+        _blockActive = false;
+        _isPracticeBlock = false;
         _doneConditions.Clear();
         conditionsCompleted = 0;
+    }
+
+    /// <summary>
+    /// Start the practice block: <see cref="PracticeTrials"/> familiarisation trials in the fixed
+    /// AudioVisual + Adaptive condition. Practice trials look identical to real ones from the
+    /// participant's side (count-in → take) but no questionnaire follows and the data logger
+    /// discards them. Fires <see cref="OnPracticeEnded"/> immediately if practice is disabled.
+    /// </summary>
+    public void StartPracticeBlock()
+    {
+        if (PracticeTrials <= 0)
+        {
+            OnPracticeEnded?.Invoke();
+            return;
+        }
+
+        _condition = ConditionInfo.FromConditionId(-1, PracticeConditionId);
+        _isPracticeBlock = true;
+        _currentRep = 1;
+        _currentTrialCountInSpeed = PickCountInSpeed();
+        _blockActive = true;
+        currentBlock = $"PRACTICE {_condition} reps={PracticeTrials}";
+
+        if (controller != null)
+        {
+            controller.SetModality(_condition.modality);
+            controller.SetMode(_condition.interactivity);
+        }
+
+        OnTrialStarted?.Invoke(CurrentTrial);
     }
 
     /// <summary>Start a condition block (experimenter picked it from the UI). Configures the
@@ -187,6 +238,7 @@ public class ARMEUserStudySession : MonoBehaviour
     {
         int blockOrder = _blocksStarted++;
         _condition = ConditionInfo.FromConditionId(blockOrder, conditionId);
+        _isPracticeBlock = false;
         _currentRep = 1;
         _currentTrialCountInSpeed = PickCountInSpeed();
         _blockActive = true;
@@ -202,17 +254,26 @@ public class ARMEUserStudySession : MonoBehaviour
     }
 
     /// <summary>Called by the UI when a rep's take finishes. Ends the trial and either starts the
-    /// next rep or, after the last rep, ends the block so ratings can be collected.</summary>
+    /// next rep or, after the last rep, ends the block — a real block moves on to ratings, the
+    /// practice block hands control back to the picker.</summary>
     public void EndTake()
     {
         if (!_blockActive) return;
         OnTrialEnded?.Invoke(CurrentTrial);
 
-        if (_currentRep < RepsPerCondition)
+        int reps = _isPracticeBlock ? PracticeTrials : RepsPerCondition;
+        if (_currentRep < reps)
         {
             _currentRep++;
             _currentTrialCountInSpeed = PickCountInSpeed();
             OnTrialStarted?.Invoke(CurrentTrial);
+        }
+        else if (_isPracticeBlock)
+        {
+            _blockActive = false;
+            _isPracticeBlock = false;
+            currentBlock = "(practice done)";
+            OnPracticeEnded?.Invoke();
         }
         else
         {

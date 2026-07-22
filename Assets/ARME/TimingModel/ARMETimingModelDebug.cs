@@ -150,7 +150,6 @@ namespace ARMETiming
 
         // Private members
         private SimpleTimingModel _timingModel;
-        private bool _isInitialized = false;
         private float _simulationTime = 0f;
         private float _lastOnsetTime = 0f;
 
@@ -173,7 +172,6 @@ namespace ARMETiming
                 // Wait a moment for parameters to fully initialize
                 System.Threading.Thread.Sleep(50);
                 
-                _isInitialized = true;
                 Debug.Log($"🎵 Timing Model ready!");
             }
             catch (ARMETimingException ex)
