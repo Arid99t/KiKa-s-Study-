@@ -282,12 +282,15 @@ public class ARMEUserStudySession : MonoBehaviour
         }
     }
 
-    /// <summary>Called by the UI when the participant submits the block's four ratings.</summary>
+    /// <summary>Called by the UI when the participant submits the block's five ratings.</summary>
     public void SubmitRatings(RatingsData ratings)
     {
         _doneConditions.Add(_condition.conditionId);
         conditionsCompleted = _doneConditions.Count;
         OnRatingsSubmitted?.Invoke(_condition.conditionId, ratings);
+
+        // Let every ratings subscriber store the final answers before completion saves them.
+        if (AllConditionsDone) Finish();
     }
 
     /// <summary>End the whole session (experimenter pressed Finish, or all six conditions done).</summary>

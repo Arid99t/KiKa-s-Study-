@@ -336,8 +336,8 @@ public class ARMEUserStudyExperimentUI : MonoBehaviour
 
     private void HandleRatingsSubmitted(int conditionId, RatingsData ratings)
     {
-        if (session != null && session.AllConditionsDone) session.Finish();
-        else ShowPicker();
+        // The session finishes after all ratings subscribers have received the answers.
+        if (session == null || !session.AllConditionsDone) ShowPicker();
     }
 
     private void HandleSessionComplete()
